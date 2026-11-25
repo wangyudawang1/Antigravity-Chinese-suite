@@ -1,0 +1,17 @@
+name: 功能建议 (Feature Request)
+description: 提议新的脚本选项、诊断能力或上游同步需求
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 希望解决什么问题？
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 期望的实现方式
+    validations:
+      required: false

@@ -1,0 +1,51 @@
+name: 问题反馈 (Bug Report)
+description: 反馈安装、卸载、状态检查或兼容性问题
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请先确认问题发生在 **套件整合/安装流程**，并尽可能附上 `doctor --json` 的输出结果。
+        若是汉化词条遗漏或看板自身界面问题，请同时参考 `NOTICE.md` 前往对应上游仓库反馈。
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 已完全退出 Antigravity（含系统托盘图标）后再运行安装/卸载
+          required: true
+        - label: Node.js 版本满足 >= 22.4.0（或仅装汉化 >= 18.18.0）
+          required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Antigravity 客户端版本 & Node.js 版本
+      placeholder: "例如：Antigravity 2.35.1 / Node v22.23.2"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: 诊断输出 (环境诊断.bat 或 node scripts/suite.js doctor --json)
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: description
+    attributes:
+      label: 复现步骤与错误日志
+      placeholder: 请描述你执行的命令或双击的脚本，以及终端报错内容
+    validations:
+      required: true

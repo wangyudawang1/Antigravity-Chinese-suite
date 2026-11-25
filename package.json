@@ -1,0 +1,29 @@
+{
+  "name": "antigravity-chinese-suite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Google Antigravity 桌面端中文套件：简体中文深度汉化 + 对话上下文与 Token 用量看板，跨平台统一安装、还原与诊断工具",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "upstream": {
+    "chineseLocalization": {
+      "repo": "antigravity-cn-community/Antigravity-Chinese-Localization",
+      "commit": "e66b515",
+      "version": "2.35.0"
+    },
+    "contextViewer": {
+      "repo": "elviscjn-cjn/antigravity-context-viewer",
+      "tag": "v0.9.2"
+    }
+  },
+  "scripts": {
+    "install-suite": "node scripts/suite.js install",
+    "uninstall-suite": "node scripts/suite.js uninstall",
+    "status": "node scripts/suite.js status",
+    "doctor": "node scripts/suite.js doctor",
+    "check-upstream": "node scripts/check-upstream.js",
+    "test": "node --test tests/suite.test.js"
+  }
+}

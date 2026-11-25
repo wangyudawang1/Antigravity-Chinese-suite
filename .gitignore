@@ -1,0 +1,13 @@
+# 本地运行产物
+downloads/
+*.log
+Thumbs.db
+.DS_Store
+node_modules/
+
+# 安装器/组件在运行期生成的临时目录与大体积制品
+.app-staging/
+components/chinese-localization/extracted/
+components/chinese-localization/app.asar.ready
+.idea/
+.vscode/

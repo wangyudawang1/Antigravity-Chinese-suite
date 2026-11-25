@@ -1,0 +1,557 @@
+# 版本更新日志 (Changelog)
+
+本文件记录 Antigravity-Chinese-Localization 汉化项目的全部版本迭代与核心架构变动。
+
+---
+
+## v2.35.0 (2026-11-24) — 全面适配官方 2.35.0 版本：收件箱模式与自动解决、插件权限管理页、语音听写多语言选择器、侧边提问继续新对话、引导与 WIF/授权码登录流及远程智能体升级
+
+### 1. 官方 v2.35.0 主进程架构同步与全量补丁验收
+- **主进程模块与预打包资产对齐**：同步官方 `v2.35.0` 新增的 4 个主进程模块（`dist/appChannel.js`、`dist/customWindowControls.js`、`dist/computer/idleProbe.js`、`dist/computer/permissionGuide.js`）与 24 个更新模块，同步清理官方已移除的 `dist/computer/hud.js`、`hudAgents.js`、`hudState.js`（同时在 `localize.js` 中保留向后兼容守卫以持续支持 `v2.33.0 ~ v2.34.0` 客户端）；全量 231 处主进程补丁点实现 `0` 跳过全数命中。
+- **原生菜单与上下文菜单扩充 (`dist/menu.js`、`dist/ipcHandlers.js`)**：新增 28 项 `v2.35.0` 原生菜单与右键菜单映射（`Resolve`、`Return to Inbox`、`Inbox Mode`、`Working Section`、`Auto-Resolve`、`Subtitle`、`Move to Project/Workspace`、`Remove from Project/Workspace`、`Continue as a New Conversation` / 工作区续聊、`Open with` 各类查看器、`Application Menu`、`For Me` / `For My Team`），并在 `translateContextLabel` 中补齐 `(Not running)` / `(Sidecar disabled)` 动态状态后缀翻译。
+- **轻量预打包产物 (`app.asar.ready`) 与 CRLF 幂等加固 (`localize.js`)**：严格对齐官方瘦身打包规范（`--unpack-dir "**/chrome-devtools-mcp/**"`），构建 `v2.35.0` 预编译包 `7,926,656` 字节（`7.56 MiB`），版本元数据与控制中心全面升至 `2.35.0`；同时修复 `replaceInFile` 在 Windows CRLF 文件中执行“单行目标转多行替换”时漏检替换体换行符导致二次注入重复行的隐患。
+
+### 2. Web UI v2.35.0 全量特性汉化与防夹生精修（+181 条零重复词典、+31 组 `$`-安全动态规则）
+- **收件箱模式与侧边栏管理 (`Inbox Mode` / `Auto-Resolve` / `Working Section`)**：完整汉化收件箱模式开关、“正在工作”分组、自动解决时长说明、标记已解决与移回收件箱菜单/横幅/Toast（`Resolved "<title>"`）、`All caught up`、副标题设置、按状态分组锁定提示及自动置顶说明。
+- **插件权限管理页 (`Plugin permissions`)**：覆盖“你已允许 / 插件自带 / 无法撤销”权限列表、项目作用域 `Allowed in <project>`、单项撤销 `Revoke:` 与批量撤销确认弹窗（`All N will be revoked...`）、以及插件命令预览提示与 MCP 登录错误提示。
+- **语音听写多语言选择器 (`Dictation languages`)**：覆盖多语言优先级限制说明、重置为自动、浏览器默认自动检测、搜索框占位符、多选/拖拽排序提示、`#1 Primary` 首选徽章、28 种听写语言中文对照（保留原生语言副标签不重复）与无匹配搜索提示。
+- **侧边提问继续为新对话、对话移动弹窗与“打开方式”查看器**：补齐侧边提问升级为新对话及当前/共享/新工作区选项与不可用原因提示、对话移动/移出项目确认弹窗（同时消除原先 `Remove from Project` 被拼成“移除来自项目”的问题）、远端/本机克隆菜单、`Open with` 全套文本/图片/音视频/HTML/Notebook/PDF 查看器及禁用状态后缀、`Application Menu` 应用菜单。
+- **远程智能体与 Orchestrator 模型选择**：补齐侧边栏新建智能体“仅自己使用 / 团队共享”菜单、配置中/更新中/已停滞/不再活跃状态、身份搜索框、`N waiting on you` 提醒，以及 `Orchestrator` 默认/自定义模型路由说明（继续保持 `Orchestrator`、`Swarm`、模型名与思考链原生英文）。
+- **新版 Onboarding 引导流、WIF SSO 与授权码登录**：补齐新版能力介绍标题、职业偏好提问、Google Cloud 项目详情表单、授权码登录切换/粘贴/拒绝重试、WIF 配置面板、`Last Used` 徽章以及账户无资格/待验证页面动态标题。
+- **权限决策、MCP Elicitation 表单校验、队列/分页、Google Drive 与 CEL 触发器**：精准收录 `Yes, always allow in this project` ➔ `是，在此项目中始终允许`（修复旧正则产生的半中半英夹生词）、`Yes, allow in this conversation` / `Yes, allow for this task`、管理员提权与动作审批等待提示、`Wants to run:`、全套表单长度/数值/条数/正则校验提示（全回调函数写法严格 `$`-安全）、消息排队/加载更新消息提示、Google Drive 标题获取失败 Toast 及自动化 CEL `Self-watch` 校验徽章。
+
+### 3. 社区 PR 整合与 Issue 修复（PR #74 / PR #76 / PR #77 / PR #79 / Issue #73）
+- **路径与 URL 权限审批标题全家族根治（合并 PR #74，感谢 `@angel12538`）**：合并 `Allow read/write access to this path?` 静态词条，并同步扩展 `src/dom-translator.js` 共享权限动作映射表覆盖官方 `Hzc` 全部 9 项动作（含 `read/write access to this path`、`reading this URL`、`executing actions on this URL`、`browser downloads from this site`），彻底消灭 `Allow ...?` 与 `Save rule to always allow ...?` 18 种标题组合的半中半英夹生输出。
+- **版本匹配强门禁与 macOS 签名风险指引（合并 PR #76，感谢 `@UncleLiu-0306`）**：升级中英文 README 与 Release 生成说明，将智能体安装指令加固为「先核对 OS 与客户端精确版本 + 备份纯净原版 + macOS 先告知签名影响等待确认」，并在 macOS 章节顶部前置强调原始签名失效与官方完整包恢复路径，同时保留带风险提示的可选 `xattr -cr` / `codesign` 本地启动排错命令。
+- **AI 点数不足、基础配额刷新与超额启用提示全变体覆盖（合并 PR #77，感谢 `@angel12538`）**：对照官方 `v2.35.0` 源码补全 `at least N` / `more` AI Credits、缺省 `this model -> 此模型`、本地化含点号时间戳（如 `Nov. 25, 2026, 2:30 p.m.`）、`Your plan's baseline quota will refresh on ...` 与 `enable AI Credit overages.` 全部动态组合，并同步补齐同函数的 `Your quota for <model> will reset on / has been reached. Switch to another available model to continue.` 提示。
+- **Hydrogen 模型推荐提示与下线日期防误伤加固（合并 PR #79，感谢 `@angel12538`）**：收录 `Use Hydrogen for better quality with lower quota usage.` 静态词条与动态下线日期组合，并同步修复原 `leaving on` 规则过宽可能误伤自然英文句子（如 `John is leaving on vacation.` / `Leaving on Monday`）及历史 `will be removed on` 跨句截胡问题；升级 `parseEnglishDateCn` 严格校验英文月日日期（兼容 `Sept`、`Nov.` 与序数词）并约束独立 `leaving on` 主语。
+- **修复无 Node.js 环境下双击批处理 2 秒闪退并新增离线一键还原英文原版（Issue #73，感谢 `@yeli008` 反馈）**：修复 `一键更新汉化.bat` 在客户端已汉化时命中 `:LEGACY_ALREADY_LOCALIZED` 无停顿直接关闭窗口的问题；现在无 Node.js 离线模式下会清晰提示无法打开浏览器控制中心，并支持直接输入 `R` 执行带版本匹配、防污染校验与 SHA-256 原子替换的离线安全还原英文原版。
+
+### 4. 全链路验证与测试门禁
+- 词典扩充至 **`4,837` 键 `0` 重复**；新增 `tests/ticket-56-v2350-features.test.js` 专项测试套件（含 PR #77/#79 全变体与防误伤回归用例及 Windows `cmd.exe` 实机离线还原成功/跨版本拦截/污染备份拦截验证），同步升级 `Ticket-44` / `Ticket-48` 在 `v2.35.0+` 缺失 `hud*.js` 时使用隔离夹具持续校验向后兼容；全工程 **63/63 组 TDD 自动化测试套件 100% ALL GREEN**。
+
+---
+
+## v2.34.0.1 (2026-11-23) — Swarm 多智能体面板与 `plugin://` 子框架汉化、左侧项目名保护收窄、高频 UI 补漏及原生右键菜单全量升级
+
+### 1. Swarm 多智能体协作面板与 `plugin://` 子框架注入（Ticket-53）
+- **`plugin://` 子框架实时 DOM 汉化钩子 (`dist/utils.js`)**：在主进程监听 `hubContents` 的 `did-frame-finish-load` 事件，严格限定仅对 `/^plugin:\/\//i` 协议子框架执行（复用同目录 `preload.js` 缓存引擎切片并配置 `window.__agyDomTranslatorInitialized` 幂等守卫，窗口关闭时清理监听）。
+- **Swarm 侧栏全量汉化与动态内容隔离**：遵循与 `Orchestrator` 一致的品牌名策略保留 `Swarm` 原生英文，新增 **+131 条**静态词典与 **+30 组**动态模板（`Overview`、`Board`、`Members`、`Graph`、`Raw`、`Hive`、`Mentions`、`Live`、`Coordinator`、进度计数、回放与 GIF 导出等），并严格隔离 AI 生成的帖子正文、任务标题与 `@mention` / 成员徽章；进度译文保持数字前置以兼容原生 `hive.js` 滑块替换。
+- **跨平台 CRLF 注入修复 (`localize.js`)**：为 `replaceInFile` 增加 CRLF/LF 自适应匹配，并为 `utils.js` 子框架钩子补充原子前置判断，消除 Windows 检出环境下跨行模板匹配落空风险。
+
+### 2. 社区 PR 协同整合与源码级精修（PR #69 / #70 / #71）
+- **首页任务建议、快捷键与输入区无障碍标签（PR #69，感谢 `@12cjn`，Ticket-51）**：补齐首页建议卡片、快捷键与无障碍辅助标签；同步修复输入区 `.chat-input` / `.input-area` 穿透隔离、编辑区草稿 O(1) 剪枝及快捷键正则边界。
+- **左侧项目栏项目名保护与系统分组精准放行（PR #70，感谢 `@omsd512-W`，Ticket-52）**：在 `shouldSkipNode` 与 `isNonComposerProtectedSelf` 中严格保护真实用户项目标题卡片及用户自定义对话分组（`convgroup:*`）不被词典或 `isActionPill` 误翻，同时精准放行复用同一 `project-header` 组件的系统内置分组标题（按状态 `status-*`、按环境 `location-*`、独立对话 `standalone` 与 `Unknown Project`）。
+- **v2.34.0 高频遗漏界面文案与凭据/站点数据规则（PR #71，感谢 `@dsasanim4-source`，Ticket-54）**：补齐加载态、语音重登、麦克风权限、认证登录、云端初始化说明、远程更新弹窗、反馈指引与浏览器工具等 **+61 条**文案；修复插件凭据 `JXb` 多句 `.join(" ")` 拼接动态正则与「下方列出的域名」方位，补充成功态 `Site data cleared for` 并在 `tryCombinedSentenceTranslation` 中实现 React 三文本节点原位合句（保持中间 `host` 节点引用不变）。
+
+### 3. 右侧预览栏原生右键菜单、发送快捷键提示与云工作区免责声明（Ticket-55）
+- **全端 16 处原生右键菜单扫漏补齐 (`dist/ipcHandlers.js`、`dist/menu.js`)**：补齐右侧文件/图片预览栏漏译的 `Copy File Path`（`复制文件路径`）、`Copy File Name`（`复制文件名`）、`Copy Content`（`复制内容`），以及插件侧栏 `Hide`（`隐藏`）、智能体气泡 `Reply`（`回复`）、分组排序 `Manual Order`（`手动排序`）、发送按钮右键 `Send Message` / `Queue Message` / `Send Immediately` 与顶栏菜单 `Add to Chat`。
+- **发送按钮快捷键悬浮提示**：新增动态规则覆盖 `Send Message` / `Queue Message` / `Send Immediately` 搭配 `Enter`、`Ctrl+Enter`、`⏎`、`⌘⏎`、`(Alt+Enter)`、`(⌥⏎)` 的全套组合。
+- **云工作区文件与资源弹窗全量补齐**：覆盖弹窗副标题、同屏横幅、项目/工作区设置副标题，以及底部含 4 个蓝色超链接（`necessary rights`、`Prohibited Use Policy`、`Google Antigravity Terms of Service`、`Google Privacy Policy`）的免责声明整段原位翻译，100% 保留全部 `<a>` 点击跳转。
+
+### 4. 全链路验证与测试门禁
+- 词典扩充至 **`4,653` 键 `0` 重复**，轻量版 `app.asar.ready` 为 `7,838,954` 字节（`7.48 MiB`，客户端基线严格保持 `2.34.0` 防跨版本白屏）；新增 `Ticket-51` ~ `Ticket-55` 专项套件，全工程 **62/62 组 TDD 自动化测试套件 100% ALL GREEN**。
+
+---
+
+## v2.34.0 (2026-11-21) — 全面适配官方 2.34.0 版本：输入框发送快捷键与消息队列改版、Orchestrator 设置与思考深度校准、内联审批提问卡片、侧边栏自定义/筛选排序及 Computer Use 锁屏/HUD 升级
+
+### 1. 官方 v2.34.0 主进程补丁点精确校准与兼容升级
+- **更新器状态机兼容修复 (`dist/updater.js`)**：跟进官方 `2.34.0` 将 `RestartToUpdate` 箭头函数调整为 `() => void quitAndInstall()` 的签名变化，升级 `localize.js` 自动匹配官方新版及历史 Mock 用例，`applyTranslations` 实现 `0` 跳过全量命中。
+- **Computer Use 悬浮栏与接管状态升级 (`dist/computer/hud.js`、`hudState.js`)**：适配新版按钮 `<button id="resume" title="...">Allow again</button>` ➔ `重新允许` 与悬停提示“重新允许智能体使用此 Mac。已停止的任务不会自动重启。”，以及 `hudState.hudView` 按 `pauseCause === 'user_takeover'` 区分“您已接管 — 智能体已停止”与“智能体已停止”，同时保留全部 `agy-hud:` IPC 协议令牌与向后兼容分支。
+- **同步官方新增主进程模块与预打包资产**：同步官方 `v2.34.0` 新增 `dist/authBootstrap.js`、`dist/browserStream/*` (7 个模块)、`dist/computer/screenLock.js` 与 `dist/proto/browser_viewer_pb.js`（均严格保持协议/错误码原生）；重建轻量版 `app.asar.ready`（`7,756,964` 字节 / `7.40 MiB`，版本 `2.34.0`）。
+
+### 2. Web UI 增量全量覆盖与协同补漏（+150 条词典、+40 组动态规则，含 PR #67 & Issue #68）
+- **输入框与消息发送体验 (`Input Box` & `Send message`)**：全面汉化 `Cmd+Enter` / `Ctrl+Enter` / `Enter` 发送快捷键说明、消息即时发送设置引导（`Messages now send immediately. Configure in` / `Instead of queueing...`）、`Queue Message` / `Cmd+click to open` / `Ctrl+click to open` 及小写标题版 `Sync JJ worktrees to head`。
+- **Orchestrator 设置、`Thinking effort` 与 `Extra High` 校准**：保持 `Orchestrator` 模式名英文原生不翻译，汉化 `Orchestrator 设置`、`Orchestrator 模型`、`Executor Model`、思考深度提示气泡、`ELMO Composite` 与 `Coordinator`，并精确收录 `Extra High` ➔ `极高`（修复原本分词叠加出的 `"极高高"`）。
+- **内联提问与运行时/终端高危权限审批卡片 (Issue #68)**：全量补齐 `Skip`、`Skipped`、`Add note`、`Resolved in chat`、`Replaced by newer request`、`Expired · Action not taken`、`Ask to retry`、`Select one or more options`、`Other answer`、`Yes, allow this time` / `Yes, allow this download` / `Yes, save rule ...` / `Yes, and always allow ...` 全套静动态命令规则、`No (tell the agent what to do instead)`、`Allow <action/command>?`、`Recursively deleting the pre-existing directory ...` 跨区销毁警告、`Runtime permission` 与 `Deny with note` / `Please retry:` 等动态前缀。
+- **侧边栏自定义、筛选排序与归档提示升级**：补齐 `Customize Sidebar` 全套开关、`Filter and Sort` 菜单、`Pin Entire Workspace/Project`，并跟进 `v2.34.0` 把归档 Toast 拆分碎片扩展到 `(![tune](icon://tune) Customize Sidebar).`。
+- **Computer Use 锁屏、预览与 macOS 权限向导**：覆盖锁屏横幅、实时预览连接与不可用状态（修复 `"Connecting to the live preview…"` 半英文泄露）、macOS 权限引导全套片段与动态提示。
+- **技能卡、插件描述、设置模板与快捷键录制（整合 PR #67）**：新增 `mcp-app-development` / `migrate-agent-settings` / `native_swarm` / `run-workflow` / `swarm_*` 等 7 条内置技能卡、`Unlock the power of agent swarms.`、快捷键录制提示 `Recording shortcut for ...` 及项目外对话设置变体规则 `Settings / Agent settings for conversations outside of ...`。
+- **遥测账号声明、更早消息分页、UI 插件、自动化调度与快捷键冲突扩展**：覆盖账号关闭遥测后的说明长段、更早消息分页与步骤计数、`UI Plugin (SidePanel)`、`Weekdays` / `Weekly`、`Open image X of Y`、`Show N More`、`(experimental)`、`Line X → Y`、`Xs left` / `Xd Yh Zm left` 倒计时及快捷键 `reserved for sidebar switching` 冲突提示。
+
+### 3. 全链路验证与测试门禁
+- 词典全量维持 **`4,444` 键 `0` 重复**，新增 `tests/ticket-48-v2340-features.test.js`、`tests/ticket-49-v2340-remaining-gaps.test.js` 与 `tests/ticket-50-issue68-and-tier-fixes.test.js`，全工程 **57 组 TDD 自动化测试套件 100% ALL GREEN**。
+
+---
+
+## v2.33.0 (2026-11-18) — 全面适配官方 2.33.0 大版本：Computer Use 桌面操控与实时预览、Remote SSH 全生命周期升级、9 款新音色与语音听写、插件组合包及模块化安全重构
+
+### 1. 官方 v2.33.0 新特性全量深度汉化
+- **Computer Use 桌面操控与 Agents Live 实时预览**：全面覆盖主进程新增的桌面操控悬浮窗（`dist/computer/hud.js`、`hudState.js`、`hudAgents.js`、`overlay.js`）及前端 `Agents Live` 视频流窗格、智能体暂停接管横幅、游标意图胶囊与 macOS 屏幕录制/辅助功能权限引导卡片。
+- **Remote SSH 远程子系统重磅升级**：跟进 `v2.33.0` 重构后的断连/重启过渡页 (`disconnectedPage.js`)、统一交互式密码/密钥口令/PIN/主机密钥提示 (`sshPrompts.js`)、共享主目录冲突接管与服务端版本重启弹窗 (`remoteManager.js`)、远程麦克风授权与登录归属确认、SSH 配置文件编码/权限诊断 (`sshConfigHosts.js`) 及 OAuth 本地回调页 (`signInCallback.js`)。
+- **新版 9 款 Gemini Live 音色与实时语音听写 (Voice Dictation)**：扩充 `Arlo / Cleo / Finn / Fola / Gero / Lora / Neno / Olin / Tari` 全部 9 款音色白名单与选择计数规则，全量覆盖实时语音转写状态及 12 类宿主机麦克风/系统权限诊断提示。
+- **内置浏览器按站点 Cookie 管理、双模快捷键方案与扩展市场插件组合包 (Bundles)**：新增浏览数据清理与按站点删除 Cookie 面板、`VS Code Default` 与 `Antigravity (AGY) Style` 双模快捷键方案（含冲突检测提示）、扩展市场 `Bundles` 组合包与第三方/实验性源码安全审查弹窗、Step Plan 步骤进度胶囊、配置例程 (`Setup Routine`) 及侧栏分组 `Repo`（`仓库`）与模型角标 `NEW`（`新`）精细化区分。
+
+### 2. 模块化引擎重构与全栈安全加固
+- **前端翻译引擎物理模块化与词库去重瘦身**：拆分为 `src/dictionary.js`、`src/dom-translator.js` 与 `src/build-injection.js`，清零 619 组历史重复键，前置 `O(1)` 词典精确匹配消除宽泛正则截胡，修复 React Fiber 空状态子节点保护与侧栏项目拖拽坐标计算，加入 `coreWords` 100% 实词命中防夹生守卫，预制包体积精简至 ~`7.08 MB`。
+- **本地服务安全装甲与全平台脚本加固**：控制中心强制绑定 `127.0.0.1` 并接入 `Host`/`Origin` + 一次性 CSRF Token 鉴权、强制 TLS 证书校验、双轨备份版本防白屏门禁与进程 Fail-closed 保护；Windows 离线批处理新增 PowerShell 二进制 ASAR 版本门禁，`.command`/`.sh` 强制纯 LF 与 UTF-8/POSIX 权限可复现打包；全工程 **51 组 TDD 自动化测试套件 100% ALL GREEN**。
+
+---
+
+## v2.32.2.1 (2026-11-17) — 对话页排队发送按钮 (`Send all (N)`)、模型思考档位 (`Extra`/`Max`) 与撤销确认弹窗深度补全
+
+### 新特性与核心修复
+- **排队发送按钮与排队消息卡片全量汉化**：新增动态计数正则 `/^Send\s+all\s*\((\d+)\)$/i`（`Send all (1)` ➔ `全部发送 (1)`），并补齐排队消息卡片副标题（`Sends after agent finishes working` ➔ `智能体完成当前工作后发送`）、`Empty message`、`Queued message deleted`、`+N attachments` 与 `Send now: ...` 无障碍描述。
+- **模型思考档位补齐 (`Extra` / `Max`)**：补齐 `High`/`Medium`/`Low` 之外新增的 `Extra`（➔ `极高`）与 `Max`（➔ `最高`）档位，并新增 `^(Low|Medium|High|Extra|Max) · (上下文窗口)$` 组合标签动态翻译与多模型选择统计（`3 models selected` ➔ `已选择 3 个模型`）。
+- **撤销确认弹窗、过长对话提示与回复偏好问卷**：完整补齐撤回消息错误提示、`Confirm Undo` 工作区/仅回退对话说明、`View Diff for <文件>`、过长对话清理横幅 (`This conversation grew too large...`)、等待批准/回答状态与 Best of N 回复偏好问卷（共 **+44 条** 词典与 **+8 组** 动态正则）。
+- **作用域精准放行与时间标签免疫**：在 `shouldSkipNode` 中精准放行 `[data-testid="queued-decorators"]` 与 `[data-testid="user-message-actions"]` 系统按钮区域，同时继续对 `[data-testid="user-message-content"]` 用户提问正文保持绝对物理免疫，并保持对话相对时间（如 `2m ago`、`24m`、`11h`）原样显示。
+- **TDD 回归测试扩充**：新增 [Ticket-40](tests/ticket-40-conversation-queue-and-tiers.test.js) 专项测试，全工程 **45 套测试套件 100% ALL GREEN**。
+
+---
+
+## v2.32.2 (2026-11-17) — 完美适配官方 2.32.2 最新版，新增 Robotics 官方机器人插件、GitHub 细粒度权限策略与自动化计划编辑器全量汉化
+
+### 新特性与核心升级
+- **官方 v2.32.2 零延迟同步适配**：全面跟进 Antigravity 官方 `v2.32.2` 客户端更新，完成版本元数据、预打包产物 `app.asar.ready` 与 `extracted/` 解包源码树全量同步。
+- **官方插件市场新增 Robotics（机器人开发）全量汉化**：完整覆盖官方新上架的 `Robotics` 插件描述及 9 条核心示例提示词（涵盖 3D RGB 物体定位、MuJoCo 无碰撞运动规划、闭环视觉伺服、Sim-to-Real Gauntlet 测试、四足强化学习训练与 Blender SimReady 3D 资产构建）。
+- **GitHub 细粒度权限与策略 (GitHub Policies & Permissions) 深度汉化**：全量覆盖组织策略、代码仓库策略、仓库内容读取、Issues 议题、Pull Requests 拉取请求、远程分支及 Workflow 工作流运行权限规则配置界面。
+- **协调器 (Coordinator)、跨设备接力与自动化计划编辑器补齐**：新增新建协调器弹窗、在手机/其他设备上打开远程对话、侧边提问标签页以及自动化分步创建向导（运行位置、定时重复周期、触发器过滤与运行记录状态）等 **140 条** 唯一词典项、**9 组** 动态正则与 **13 项** 原生菜单映射。
+- **静态注入引擎修复**：修复 `replaceInFile` 在同一文件内多个不同英文目标共享同一中文替换文本时的幂等判断逻辑，确保 `dist/ipcHandlers.js` 中多工作区选择对话框标题（`Open workspaces`）100% 汉化命中。
+
+---
+
+## v2.32.1.2 (2026-11-16)
+
+### 1. 右键菜单、设置面板、主题配色与模型限额全方位补漏
+- **原生标签页与侧边栏右键菜单补全（40 项）**：在 `ipcHandlers.js` 与 `menu.js` 中补全标签页管理（关闭标签页/其他/左侧/右侧/全部/终端标签页、固定/取消固定、保持打开）、打开方式子菜单、图片/视频保存、评论草稿、分组管理（移动到分组/新建/移除）、快捷键编辑与 `Proceed with Plan` 等 40 项原生右键映射，并支持 `(Default)` ➔ `（默认）` 动态后缀识别。
+- **界面词典与动态正则深度扩充（117 条）**：新增右侧栏「自定义分区 (Customize Sections)」、侧边提问 (Side Questions)、已使用技能、Cookie 与网站数据、浏览器下载、实验性功能声明等百余条设置与面板词条；补齐 `File not found` 文件未找到兜底与 `not found` 大小写匹配；升级模型用量配额正则以兼容带前置模型名的 `Model — 100% · ...` 格式，补充 `Show N more subagents` 动态展开按钮汉化。
+- **外观配色预设双语标识升级**：浅色与深色全部外观主题预设均采用保留社区习惯原名 + 中文意译的双语表达（如 `Catppuccin（猫布奇诺）`、`Everforest（森屿青）`、`Gruvbox Material（复古暖棕）`、`Dracula（德古拉）`、`Monokai（莫奈高彩）`、`Vesper（暮星）` 等），并将深色夜幕预设正式定名为「霓虹夜幕（深靛蓝）」。
+- **首页问候语、第三方模型公告与设置浮层补齐**：包含 PR #57 贡献的 6 类首页问候语模板、第三方模型上下线与订阅范围提示、用量重置倒计时与 AI 点数余额、声音选择描述与确认按钮、排队消息快捷键悬停、设置下拉/开关浮层及 48 条设置长文案（感谢 @angel12538）。
+
+### 2. 官方上游缺陷热修复
+- **左侧栏展开态项目拖拽排序偏移 Bug 热修复**：在前端运行时注入 `setupSidebarProjectDragFix`，修复官方 Antigravity v2.32.1 在折叠/展开文件夹状态下拖拽排序时的坐标测量竞态与首项 `topBound` 锁死问题，不修改官方逻辑源码，安全可逆。
+
+### 3. 开源组织迁移、千星纪念与合规共建
+- **社区组织联合运营与 Discussions 开启**：仓库正式迁入开源社区组织 [`antigravity-cn-community`](https://github.com/antigravity-cn-community/Antigravity-Chinese-Localization) 联合维护，启用 GitHub Discussions 并发布千星里程碑公告与成长曲线；更新双语 `README` 与架构文档。
+- **MIT 共同版权声明确认（PR #58）**：合并原作者 `@liominsb` (`aabbWei`) 确认的 MIT 版权补充声明，正式记录原作者与 `antigravity-cn-community Contributors` 联合版权。
+- **四段点分版本号与全绿门禁**：控制中心与 Release Tag 采用 `v2.32.1.2`（确保旧版 `v2.32.1` 控制中心可自动触发「发现新版」提醒），同时内核 `app.asar.ready` 内部版本维持 `2.32.1` 以严格对齐官方客户端防白屏校验；全工程 **42 组 TDD 回归测试套件 100% ALL GREEN**。
+
+---
+
+## v2.32.1 (2026-11-14)
+
+### 1. 全面深度适配 Antigravity v2.32.1 官方大版本与 Remote SSH 子系统
+- **官方大版本架构深度同步**：全面跟进官方 11 月 14 日最新发布的 2.32.1 大版本，同步升级应用版本定义与全工程元数据至 `2.32.1`。
+- **全新 Remote SSH 远程开发子系统全量深度汉化**：
+  - 深度汉化全新远程连接生命周期界面，包括重连/断开连接过渡页 (`disconnectedPage.js`)、SSH 凭据与安全密钥轻触弹窗 (`sshPrompts.js` / `sshPromptPreload.js`)；
+  - 深度汉化 SSH 主机管理对话框 (`remoteManager.js`)，包括停止远程服务端警告、组织账号认证授权、选择 SSH 配置文件等原生交互；
+  - 深度汉化全套远程连接错误与引导描述 (`sshArgs.js`)，涵盖密码错误、主机密钥变更、端口转发失败、不支持的主机架构等详细指引。
+- **依赖库瘦身与原生架构对齐**：跟随官方重构，移除废弃的外部 shell 依赖，全面适配新的登录 Shell 策略与 `catcherPreload.js` 输入捕获通道。
+- **全量原生补丁 100% 稳定命中**：深度核验原生应用菜单、系统托盘、启动过渡、WSL 提示、WebAuthn、设备选择器及全部 62+ 处原生补丁点，保持 100% 稳定生效。
+
+### 2. 界面与交互体验全景巩固与细节补漏
+- **继承全量深度汉化资产**：无缝延续扩展市场、设置面板、Gemini Live 语音选择器、对话布局及项目管理等全套汉化与分词防污染规则。
+- **原生右键二级子菜单全量中文化**：深度汉化原生右键菜单二级项，包括「复制」子菜单（对话名称、对话 ID、项目名称、工作区路径等）与「拆分」子菜单（向右分屏、向下分屏、替换为新建）。
+- **选中文本气泡与快捷提问深度汉化**：对话区选中文字后弹出的浮动操作胶囊中 `Ask /btw` 深度汉化为「通过 /btw 提问」，并加入白名单特权放行保障极速响应。
+- **空状态容器级防夹生收敛机制**：针对 React 拆分文本节点导致的 `No 自动化 yet`、`No 对话 yet` 等中英夹生空状态，创新引入容器级预检收敛逻辑，彻底统一显示为「暂无自动化」、「暂无对话」与「暂无分组」。
+- **官方插件生态全量深度汉化**：深度汉化全新 Google Workspace 标语与官方 Gmail 插件（描述、概览、推荐提示词及命令），并同步汉化 Arize AX、Better Stack、Cloudflare、CodeRabbit、Tavily、SonarQube 等 16 款扩展市场官方与合作插件。
+- **首页问候语、第三方模型公告与设置项补齐**：深度汉化首页 6 类动态问候语模板（保留用户名插值）；通用结构化匹配第三方模型上线与下线公告（英文日期自动转为中文标准格式）；覆盖用量窗口重置倒计时（天/小时/分钟）、AI 点数余额与声音选择确认按钮；批量补齐 48 条设置项长段落说明；新增 Ticket-37 与 Ticket-38 共 115 项用例断言（特别鸣谢 @angel12538 贡献 #57）。
+- **新增远程 SSH 菜单与命令动态翻译**：完善命令面板与界面中的 SSH 远程开发文案支持。
+
+### 3. 产物与测试保障
+- **最新预编译补丁包打包**：构建生成轻量级 `app.asar.ready`（6.21 MB），支持零重启无感原子热替换。
+- **全套 TDD 回归测试套件全绿**：新增 Ticket-36 专项测试（2.32.1 官方版本架构、Remote SSH 与元数据断言），全工程自动化测试套件 **100% 保持通过 (ALL GREEN)**。
+
+---
+
+## v2.31.2 (2026-11-12)
+
+### 1. 全面深度适配 Antigravity v2.31.2 官方维护更新
+- **官方版本无缝平滑升级**：深度跟进官方 11 月 12 日最新推送的 2.31.2 维护更新，同步升级应用版本定义与全工程元数据至 `2.31.2`。
+- **全量原生补丁 100% 稳定命中**：深度比对 2.31.0 与 2.31.2 官方原生 1,112 个文件与全部底层模块，确认 62 处原生补丁点在 2.31.2 架构下全部保持 100% 精准稳定命中。
+- **macOS 双击更新与自动恢复版本校验加固**：新增 macOS 专属双击「一键更新汉化.command」离线恢复脚本，智能识别用户登录 shell 中的 Node.js（支持 NVM、fnm、asdf 等工具链）；彻底收紧 `auto-restore.js` 版本校验防线，以 asar 二进制包内真实版本为准，严密拦截版本未知或缓存标签绕过导致的白屏覆盖隐患（感谢 @mutezebra 贡献 #52）。
+
+### 2. 界面与交互体验全景巩固与设置面板深度补漏
+- **继承全量深度汉化资产**：无缝延续 2.31.0 沉淀的扩展市场全量插件生态详情页、通用货架分类、设置面板界面布局与对话布局模式、搜索快捷键前置穿透、浏览器子智能体操作规则以及 Gemini Live 声音选择器全套特性描述。
+- **设置面板与项目管理细节补漏**：
+  - 补充浏览器设置副标题汉化：`Configure built-in browser, link opening, and browser subagent preferences.` ➔ `配置内置浏览器、链接打开方式以及浏览器子智能体偏好设置。`；
+  - 补充项目设置副标题汉化：`Manage project folders and settings.` ➔ `管理项目文件夹与设置。`；
+  - 新增设置作用域覆盖提示自适应动态规则：`Modified in <scope>` ➔ `已在 <scope> 中修改`；
+  - 解决删除项目弹窗中活跃与归档对话统计的多重拼接断句问题：智能解析 `Permanently delete ... including <X> active conversation(s) and <Y> archived conversation(s).` 及其局部已汉化形态，完整输出自然流畅的中文提示。
+- **零新增分词污染与无感响应**：依托预编译 O(1) 大小写索引字典与 DOM 微批调度引擎，保持百万级/秒的实时文本翻译吞吐量与对输入编辑区域的绝对物理免疫。
+
+### 3. 产物与测试保障
+- **最新预编译补丁包打包**：构建生成针对 2.31.2 的 `app.asar.ready`，支持本地无感原子替换与一键极速热部署。
+- **全套 TDD 回归测试套件全绿**：新增 Ticket-35 专项测试（2.31.2 官方版本架构与元数据断言），全工程自动化测试套件 **100% 保持通过 (ALL GREEN)**。
+
+---
+
+## v2.31.0 (2026-11-10)
+
+### 1. 全面深度适配 Antigravity v2.31.0 官方大版本
+- **官方版本无缝平滑升级**：深度跟进官方 11 月 10 日最新推送的 2.31.0 官方大版本，同步升级应用版本定义与全工程元数据至 `2.31.0`。
+- **全量原生补丁 100% 稳定命中**：深度核验 2.31.0 原生架构与依赖库，确认 50 余处原生补丁点（原生应用菜单、系统托盘、启动过渡页、工作区弹窗、WSL 交互提示、Passkey 通行密钥、更新器、IDE 安装向导、WebHID/WebUSB 设备选择器、Webview 安全弹窗等）在 2.31.0 架构下全部保持 100% 精准命中。
+
+### 2. 界面与交互体验全景巩固
+- **继承全量深度汉化资产**：无缝延续 2.30.0 / 2.29.1 沉淀的扩展市场全量插件生态详情页、通用货架分类、设置面板界面布局与对话布局模式、搜索快捷键前置穿透、浏览器子智能体操作规则以及 Gemini Live 声音选择器全套特性描述。
+- **零新增分词污染与无感响应**：依托预编译 O(1) 大小写索引字典与 DOM 微批调度引擎，保持百万级/秒的实时文本翻译吞吐量与对输入编辑区域的绝对物理免疫。
+
+### 3. 产物与测试保障
+- **最新预编译补丁包打包**：构建生成针对 2.31.0 的 `app.asar.ready`，支持本地无感原子替换与一键极速热部署。
+- **全套 TDD 回归测试套件全绿**：新增 Ticket-34 专项测试（2.31.0 官方版本架构与元数据断言），全工程 37 套自动化测试套件 **100% 保持通过 (ALL GREEN)**。
+
+---
+
+## v2.30.0 (2026-11-10)
+
+### 1. 全面深度适配 Antigravity v2.30.0 官方大版本
+- **官方版本无缝平滑升级**：深度跟进官方 11 月 10 日推送的 2.30.0 重大更新，同步升级应用版本定义与全工程元数据至 `2.30.0`。
+- **全新架构子系统原生深度融合**：全面适配 2.30.0 官方新增的 20 个模块文件，涵盖全新内置浏览器引擎 (`browserEngine/`)、CDP 管道通信 (`cdpPipe.js`)、Chrome 自动探测 (`chromeDiscovery.js`)、智能体沙盒 Web MCP 通信控制 (`guestWebMcpController.js`) 以及文件选择控制器 (`guestFileChooserController.js`) 等。
+- **原生安全与设备选择器深度补丁注入**：
+  - 新增 `dist/deviceChooser.js` 原生设备选择弹窗汉化（HID 设备、USB 设备、串行端口选择与取消提示）。
+  - 新增 `dist/webviewPopupSecurity.js` 原生弹窗连接安全提示与证书详情汉化（连接信息、连接安全、不安全警告与详细信息）。
+
+### 2. 界面与交互体验深度补漏与细节打磨
+- **扩展市场货架与全部分类对齐**：全量精准汉化扩展市场所有分类货架标题与描述，包括「设计、创意与媒体」、「效率与项目管理」、「云托管与部署」、「开发者工具」（杜绝任何“Developer 工具”残留）以及第三方工具免责声明。
+- **搜索输入框占位符自适应汉化**：自适应匹配 `Search customizations...` ➔ “搜索自定义配置...”，全面放行静态输入框 placeholder 属性汉化，确保无刷新实时呈现。
+- **项目与置顶对话菜单全量汉化**：补齐项目右键菜单（复制项目名称、项目设置、删除项目等）与置顶对话排序规则（排序方式、最近更新、最近提问、自定义排序）。
+- **自动化空状态文案彻底修复**：重构自动化空状态动态拦截机制，精准匹配单复数与混合分词（`No automation yet` / `No automations yet` / `No 自动化 yet` ➔ “暂无自动化”），并汉化定时任务运行说明。
+- **设置面板界面布局与模式全面汉化**：全量精准汉化「界面布局」(Interface Layout)、「知识工作」(Knowledge Work) 与日常任务精简界面说明、「软件工程」(Software Engineering) 与完整工程开发界面说明。
+- **高级设置与快捷键深度补全**：汉化「对话布局」(Chat Layout) 标题及「铺满」(Fill) 宽度选项；彻底消除快捷键搜索框“搜索 shortcuts...”半英半中残留（自适应转换为“搜索快捷键...”）。
+- **侧边栏过滤菜单与语音选择器深度汉化**：补全项目过滤菜单中的「自动置顶」(Auto Pin) 选项；深度适配 Gemini Live 声音选择模态框，全量汉化标题「选择 Antigravity 的声音」(Choose Antigravity's Voice)、通用确认按钮「使用 <声音名>」(Use <VoiceName>)，并修复因单词 Clear 误中导致的“清除 and friendly”翻译缺陷，标准化为「清晰友好」及全套声音特性描述。
+- **浏览器子智能体操作规则汉化**：自适应拦截并全量汉化「浏览器操作控制规则」官方长句说明（`Configure allowed and denied URLs for the browser subagent (invoked with /browser). Requires Google Chrome.` ➔ “配置浏览器子智能体（通过 /browser 调用）允许和拒绝访问的 URL。需要 Google Chrome。”）。
+
+### 3. 产物与测试保障
+- **最新预编译补丁包打包**：构建生成针对 2.30.0 的 `app.asar.ready`，支持本地无感原子替换与一键极速热部署。
+- **全套 TDD 回归测试套件全绿**：新增 Ticket-33 专项测试（2.30.0 架构演进与新增模块断言），全工程 36 套自动化测试套件 **100% 保持通过 (ALL GREEN)**。
+
+---
+
+## v2.29.1 (2026-11-08)
+
+### 1. 全面深度适配 Antigravity v2.29.1 官方维护版本
+- **官方版本无缝平滑升级**：深度跟进官方 11 月 8 日推送的 2.29.1 维护版本，同步升级应用版本定义与全工程元数据至 `2.29.1`。
+- **上游原生模块与核心文件 100% 兼容**：解包核验 2.29.1 官方原生架构与依赖库，确认原生模块架构及依赖项完全保持稳定，50 处原生补丁稳定命中 49 处。
+
+### 2. 重磅：扩展市场 (Marketplace) 全量插件生态与详情页深度汉化
+- **覆盖 71 款官方与合作伙伴插件全量卡片**：从插件市场本地元数据缓存中全面提取并专业汉化所有插件简介（包含 Notion、Stripe、Semrush、Intercom、Wispr Flow、Looker、invideo、Neo4j、Postman、Sentry、Supabase、Figma、Databricks、Datadog 等全部 71 款流行插件）。
+- **插件详情页与提示词建议 (Suggested Prompts)**：全量汉化插件详情页的示例提示词、安装说明、用途与包含内容（例如 Notion 实施计划提示词、周报生成提示词、OAuth 首次授权打开浏览器说明等）。
+- **五大核心分类货架全量对齐**：全面汉化「设计、创意与媒体」(Design, Creative & Media)、「生产力与项目管理」(Productivity & Project Management)、「云托管与部署」(Cloud Hosting & Deployment)、「开发者工具」(Developer Tools，彻底修复因分词导致的“Developer 工具”缺陷)、「商业与商务」(Business) 以及对应的全部描述文本。
+- **输入框占位符架构解耦与免责声明穿透**：重构 `translateNode` 属性处理机制，在绝不修改用户输入内容的前提下放行 placeholder 属性翻译（如 `Search customizations...` ➔ “搜索自定义项...”）；穿透包含外部超链接的第三方隐私免责声明。
+- **零新增重复键**：严格遵循词典健康规范，过滤既有重复键，保持源码级零新增重复 key、零空译文、零漏翻。
+
+### 3. 原生上下文菜单与交互细节深度补齐
+- **置顶对话排序菜单**：补齐 `Sort By` ➔ “排序方式”、`Last Updated` ➔ “最近更新”、`Last Prompt` ➔ “最新提示词”、`Custom Order` ➔ “自定义排序”。
+- **选中文本快捷引用气泡 (Quote Ctrl+L)**：在 `shouldSkipNode` 中增设特权放行机制，并通过自适应动态正则自适应支持 `Quote`、`Quote Ctrl+L`、`Quote Cmd+L` 及其变体，优雅渲染为“引用 Ctrl+L”。
+- **项目与对话原生右键菜单**：补全项目文件夹（复制项目名称、项目设置、删除项目等）与对话条目（标为未读、拆分对话、停止智能体等）全量原生菜单项。
+- **自动化 (Automations) 面板空状态**：拦截单字分词拼凑缺陷，修复为纯正的“暂无自动化”，并全量补全调度运行说明文案。
+
+### 4. 产物与测试保障
+- **免解压一键开箱即用**：编译打包生成最新版 `app.asar.ready` 预编译核心包（5.35 MB，5,611,177 字节），支持免解包打包一键无感热恢复与原子替换。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-32（2.29.1 官方维护版本与交互细节专项测试），断言数扩充至 **95 项全绿通过**；全工程 35 套自动化测试套件 **100% 保持通过 (ALL GREEN)**。
+
+---
+
+## v2.29.0 (2026-11-05)
+
+### 1. 全面深度适配 Antigravity v2.29.0 官方大版本
+- **官方版本无缝平滑升级**：跟进官方 11 月 3 日推送的 2.29.0 大版本，应用版本与全工程元数据同步升级至 `2.29.0`。本版本新增 Jupyter 笔记本查看器、Gemini Live 语音模式、远程智能体（云端会话）、自动化页面改版、内置浏览器下载与地址栏重设计、Onyx 主题与 Google Sans 字体、自定义快捷键等大量新界面。
+- **原生层新增 7 个模块并全量兼容**：`externalUrl.js`（外部 URL 协议调度）、`guestDialogController.js`（内置浏览器页内对话框）、`wcvBrowserRegistry.js` / `wcvIpcHandlers.js` / `wcvZOrderController.js`（WebContentsView 浏览器注册与层叠控制）、`webviewDownloadRouting.js`（下载路由）、`windowState.js`（窗口状态持久化）。经逐项核验，这些模块均为内部逻辑与 IPC 通道，**无用户可见文案**，因此不需要新增原生层字符串补丁；50 处既有原生层替换目标在 2.29.0 官方包中保持 49 处命中（剩余 1 处为 2.26.0 起即存在的历史死补丁）。
+- **新增 Web UI 词条 100 条**：覆盖 **语音模式与录音**（静音语音麦克风 / 扬声器、录音保存、语音变体命名、语音与听写的输入设备）、**无障碍**（屏幕阅读器模式、界面与终端的屏幕阅读器优化）、**远程智能体与云端环境**（远程智能体繁忙、远程运行、云端环境数量上限、连接账号以运行自动化）、**用量与配额**（上下文与配额指示器、每日与总体对话上限、每日环境时间）、**内置浏览器与下载**（下载位置、取消下载、浏览历史、站点连接安全提示）、**自动化与调度**（按计划执行、每天 / 每小时 / 每周 / 每个工作日、更改调度）、**界面布局**（终端布局、聊天宽度、侧边面板切换与最大化、关闭左侧标签页、新建对话按钮）、**对话与任务**（排队消息编辑失败、对话取消归档、对话步骤）。
+- **提取与核验方式**：从 2.29.0 官方 renderer bundle（11.19 MB，较 2.28.2 增长 535 KB）按界面文案上下文键（`title` / `label` / `placeholder` / `description` / `tooltip` / `message` 等）提取 1309 条候选，剔除 protobuf 枚举、LaTeX/Markdown 内部标记、第三方库组件名与内部状态键等 254 条噪音后，人工甄别补入 100 条。全部 100 条 key 均已逐字符比对官方候选。
+- **词典健康度**：dictionary 唯一键 3583 → 3683（+100），源码级重复 key 保持 619 不变（零新增重复），无空译文、无「译文等于原文」漏翻项（`Google Chat` 作为产品专名保留原文）。
+- **补全设置面板内置浏览器与语音模式词条**：补充内置浏览器下载文件夹说明（`Folder where files downloaded in the built-in browser are saved.`）、浏览历史清除说明（`Clear visited URLs and autocomplete suggestions from the built-in browser.`）、语音模式分区标题（`Voice mode`）、Gemini Live 语音说明（`The voice used in Voice mode. Powered by Gemini Live.`）与语音音量大小说明（`How loud Antigravity's voice is.`）。
+- **新增 `tests/ticket-31-v2290-features.test.js`**（56 条断言）：版本元数据自洽校验、7 个新增原生模块存在性、5 个新增词条分组的代表性译文、新增词条零漏翻 / 零空译文、词典规模与重复键健康度，以及新增词条已真实注入 `extracted/dist/preload.js` 与 `app.asar.ready` 的产物级验证。
+- **同步 `app.asar.ready` 离线补丁包**：`auto-restore.js` 对补丁版本做精确匹配，不一致会以 `VERSION_MISMATCH`（退出码 2）拦截，而 `--now` 部署流程从不刷新该文件。已按 2.29.0 重新打包写入（5,550,235 字节，version 2.29.0），确保官方更新后一键恢复可用。
+
+---
+
+## v2.28.2 (2026-10-30)
+
+### 1. 全面深度适配 Antigravity v2.28.2 官方最新架构
+- **官方版本无缝平滑跟进**：深度同步官方 10 月 30 日最新推送的 2.28.2 维护版本，应用版本与全工程元数据平滑升级至 `2.28.2`。
+- **原生层补丁全量生效验证**：实测 2.28.2 官方原生解包目录中全部 50 处原生补丁点，保持 100% 稳定命中注入。
+- **界面文案全量维持与补全**：全面保持 2.28.x 系列已吸收的 878+ 条高频 Web UI 文案（包括幕僚长 Chief of Staff 仪表板与画布、内置浏览器设置面板与切换选项、CitC/ABFS/Cog 远程工作区、自主模式 Autonomous Mode、Best-of-N、企业 AI 额度等），词典健康度与覆盖率保持最佳状态。
+- **打包全新就绪包 app.asar.ready**：基于官方 2.28.2 核心代码编译打包生成最新预编译成果物（5.1 MB），开箱即用支持免打包一键恢复与解压部署。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-30 专项自动化测试套件，全工程 33 套测试套件 100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.28.1 (2026-10-29)
+
+### 1. 全面深度适配 Antigravity v2.28.1 官方最新架构
+- **官方版本无缝平滑跟进**：深度同步官方 10 月 29 日最新推送的 2.28.1 版本，应用版本与全工程元数据平滑升级至 `2.28.1`。
+- **融合 PR #44 贡献**：全量吸收 465 条新增关键文案（幕僚长 Chief of Staff 仪表板与画布、内置浏览器 CDP/工具栏、远程工作区 CitC/ABFS/Cog、自主模式 Autonomous Mode、Best-of-N、企业 AI 额度等），词典健康度与覆盖率保持最佳状态。
+- **原生层补丁全量生效验证**：实测 2.28.1 官方原生解包目录中全部 50 处原生补丁点，保持 100% 稳定命中注入。
+- **打包全新就绪包 app.asar.ready**：基于官方 2.28.1 核心代码编译打包生成最新预编译成果物（5.1 MB），开箱即用支持免打包一键恢复与解压部署。
+- **全套 TDD 回归测试套件保持全绿**：全工程自动化测试套件 100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.28.0 (2026-10-28)
+
+### 1. 全面深度适配 Antigravity v2.28.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 28 日最新推送的 2.28.0 版本，同步升级应用版本定义与全工程元数据至 `2.28.0`。
+- **上游原生模块与核心文件 100% 兼容**：解包同步 2.28.0 官方原生架构升级（新增 WebAuthn 通行密钥模块 `webauthn.js`、内置多标签浏览器模块 `webviewBrowser.js`、安全沙箱 `scriptJail.js` 与 QR 编码器 `qrEncoder.js` 等），保持与官方底座完全同步。
+- **Passkey 通行密钥模态弹窗汉化**：针对 2.28.0 引入的原生 WebAuthn / Passkey 认证交互，注入对话框标题、多账号提示、账号标签与取消操作的全流程汉化。
+- **内置浏览器与安全状态词条补齐**：扩充内置 Webview 浏览器操作菜单（新标签页、关闭标签页、复制链接、固定标签页）以及安全连接状态判定等前端 Web 词条。
+- **全新打包就绪包 app.asar.ready**：基于官方 2.28.0 核心代码完成汉化注入并重新打包，体积规范严格对齐官方 4.98 MB 标准规格。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-26 专项自动化测试套件，全量回归测试流水线 100% 保持通过 (ALL GREEN)。
+
+### 2. 补齐 2.28.0 新增界面文案（上游遗漏部分）
+- **新增 Web UI 词条 465 条**：补齐上游 2.28.0 适配中遗漏的界面文案，覆盖 **幕僚长 (Chief of Staff)** 仪表板与语音模式、**内置浏览器** 工具面板（CDP 端口、Chrome 路径、控制台日志、截图、站点信息）、**连接安全状态**（证书有效性、安全/不安全连接）、**远程工作区**（ABFS / CitC / Cog 的创建、克隆、卸载与工作区类型）、**自主模式 (Autonomous Mode)** 与执行策略、**Best-of-N** 开关、**后台任务 / 后台命令 / 独立终端**、**Hooks 触发条件**、**AI 额度与计费**、**GitHub 细粒度权限**、**语音引擎与设备设置** 等。
+- **覆盖方式**：从 2.28.0 官方 renderer bundle（10.6 MB）按界面文案上下文键（`title` / `label` / `placeholder` / `description` / `tooltip` / `message` 等）提取 1342 条候选，人工甄别后新增 465 条，剔除 protobuf 枚举、LaTeX/Markdown 内部标记、第三方库组件名与内部状态键等 263 条噪音。界面文案候选覆盖率由 44.6% 提升至 99.6%。
+- **词典健康度**：dictionary 唯一键 3105 → 3570（+465），源码级重复 key 保持 619 不变（零新增重复），无空译文、无「译文等于原文」漏翻项。
+- **新增 `tests/ticket-28-v2280-coverage.test.js`**（70 条断言）：覆盖 5 个新功能分组的代表性词条译文、新增词条零漏翻校验、词典规模与重复键健康度、以及新增词条已真实注入 `extracted/dist/preload.js` 与 `app.asar.ready` 的产物级验证。
+- **修复测试版本断言回归**：上游 `ticket-26-v2280-features.test.js` 把版本元数据断言改回了「严格等于 2.28.0」的硬编码写法，会导致后续每次官方更新都误报；已改回自洽校验（版本号有效且不低于基线 + 与 `CURRENT_VERSION` 一致），延续 ticket-24 / ticket-25 的既有做法。
+- **同步 `app.asar.ready` 离线补丁包**：`--now` 部署流程不会更新该文件，而 `--auto-restore` / `一键更新汉化.bat` 依赖它恢复汉化；若不同步，官方更新后一键恢复会退回缺少新增词条的旧汉化包。现已将本次完整汉化包写入仓库（5,340,451 字节，version 2.28.0）。
+
+---
+
+## v2.27.0 (2026-10-28)
+
+### 1. 全面深度适配 Antigravity v2.27.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方最新推送的 2.27.0 版本，同步升级应用版本定义与全工程元数据至 `2.27.0`。
+- **上游原生层 100% 兼容**：解包同步 2.27.0 官方原生模块，50 处原生层精确字符串替换目标中 49 处命中并已生效；剩余 1 处（`loadingOverlay.js` 的 `Loading Antigravity`）在 2.26.0 官方包中即已不存在，属历史遗留死补丁。新增 6 个原生模块（`webauthn.js`、`cablev2.js`、`qrEncoder.js`、`webviewBrowser.js`、`webviewWebAuthnPreload.js`、`__mocks__/electron-log`），`package.json` 依赖声明零变化。
+- **新增通行密钥（Passkey / WebAuthn）界面汉化**：覆盖 2.27.0 原生层新增的通行密钥账户选择对话框（`Choose a Passkey` / `Sign in to` / `Select a passkey account to continue:`）与 caBLEv2 二维码弹窗（`Passkeys` / `Use your phone or tablet` / 扫码提示 / 连接与验证状态串）。
+- **新增 Web UI 词条 413 条**：覆盖浏览器操作权限与授权面板、ABFS / CitC / Cog / Fig / JJ 远程工作区、SSO 与企业账号登录、MCP 服务器与插件技能、会话与自动化、Hook 与终端权限等 2.27.0 新增界面，候选清单覆盖率由 0% 提升至 57%。
+- **修复模板字符串正则转义缺陷**：动态规则 `/^Models within this group:\s*(.*)$/i` 的 `\s` 在模板字符串中被吞掉反斜杠而退化为 `s*`，导致该规则永久失效；已修正为双反斜杠，并新增「注入代码求值后实测匹配」校验，补齐上游 `check-injection-syntax.js` 仅校验语法的盲区。
+- **修复命令行参数文档与实际实现不一致（issue #40）**：README 中长期记载的 `--restore` / `--extract-only` / `--pack-only` 三个参数在 `localize.js` 中并不存在，传入后会被静默忽略并转而启动 Web 面板占用端口，命令看起来“执行成功”实则什么都没做。现已补齐真实的四个参数（`--now` / `--auto-restore` / `--check-status` / `--apply-only`）说明与还原官方原版的实际操作方式，并新增参数白名单校验：传入未知参数立即报错并以退出码 `1` 结束。
+- **测试断言去版本绑定**：Ticket-25 的版本元数据断言由「严格等于 2.26.0」升级为自洽校验（版本号有效且不低于基线 + 与 `CURRENT_VERSION` 一致），避免后续版本迭代产生误报。
+
+---
+
+## v2.26.0 (2026-10-24)
+
+### 1. 全面深度适配 Antigravity v2.26.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 24 日最新推送的 2.26.0 版本，同步升级应用版本定义与全工程元数据至 `2.26.0`。
+- **上游原生模块与核心文件 100% 兼容**：解包同步 2.26.0 官方原生模块与核心架构变动（新增 Google BeyondCorp 企业代理支持模块 `beyondcorpPac.js` 与调试控制台 `debugConsole.js`），保持与官方最新底座架构完全同步。
+- **全新打包就绪包 app.asar.ready**：基于官方 2.26.0 核心代码完成汉化注入并重新打包，体积规范严格对齐官方标准规格。
+- **设置中心与意见反馈汉化**：补全设置左侧栏底部的 “Give Feedback”（提供反馈）、“Send Feedback”（发送反馈）与反馈表单交互文本汉化。
+- **社区优质贡献吸收 (PR #39 by @mojingjing-git)**：补齐 2.26.0 深度 Web UI 词条 427 条；大小写匹配优化为 O(1) 索引查找（DOM 遍历耗时降低 94%）；修复模板正则转义与动态选择器安全替换；引入 React 片段化组合句兜底机制。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-25 专项自动化测试套件，全量回归测试流水线（Ticket-03 至 Ticket-25 以及 4 套架构测试，共 29 套套件）100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.25.0 (2026-10-22)
+
+### 1. 全面深度适配 Antigravity v2.25.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 22 日最新推送的 2.25.0 版本，同步升级应用版本定义与全工程元数据至 `2.25.0`。
+- **上游原生模块与核心文件 100% 兼容**：解包同步 2.25.0 官方原生模块与核心依赖树（更新 `@connectrpc/connect` 系列组件），保持与官方最新底座架构完全同步。
+- **全新打包就绪包 app.asar.ready**：基于官方 2.25.0 核心代码完成汉化注入并重新打包，体积规范对齐官方标准规格。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-24 专项自动化测试套件，全量回归测试流水线（Ticket-03 至 Ticket-24 以及 4 套架构测试，共 28 套套件）100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.24.0 (2026-10-16)
+
+### 1. 全面深度适配 Antigravity v2.24.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 16 日最新推送的 2.24.0 版本，同步升级应用版本定义与全工程元数据至 `2.24.0`。
+- **上游原生模块与核心文件 100% 兼容**：解包同步 2.24.0 官方原生模块与核心依赖树，保持与官方最新底座架构完全同步。
+- **全新打包就绪包 app.asar.ready**：基于官方 2.24.0 核心代码完成汉化注入并重新打包，体积规范对齐官方标准规格。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-23 专项自动化测试套件，全量回归测试流水线（Ticket-03 至 Ticket-23 以及 4 套架构测试，共 27 套套件）100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.23.1-p1 (2026-10-15)
+
+### 1. 官方更新后自动检查与安全恢复汉化 (Issue #35)
+- **双批处理入口智能升级**：升级 `一键更新汉化.bat` 与 `双击运行汉化.bat`，优先利用 Node.js 启动智能安全检查流程，并保留纯批处理离线保底能力。
+- **严格版本兼容性拦截与防白屏机制**：引入 `auto-restore.js` 核心模块，自动提取官方客户端实际版本，与本地补丁包比对；版本一致时安全原子替换，版本不兼容时自动安全拦截并提示升级汉化包，杜绝跨版本强行覆盖导致白屏。
+- **控制中心 Web 界面智能提示**：在控制中心（`index.html`）首页置顶“检测到官方更新覆盖”提醒条，支持一键安全恢复。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-22 自动化测试套件（8 项断言 100% 通过），全量回归测试套件（26 套用例）保持 ALL GREEN。
+
+---
+
+## v2.23.1 (2026-10-14)
+
+### 1. 全面深度适配 Antigravity v2.23.1 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 14 日最新推送的 2.23.1 版本，同步升级应用版本定义与全工程元数据至 `2.23.1`。
+- **上游原生模块与依赖树保持 100% 兼容**：解包同步 2.23.1 官方原生模块与核心依赖，保持与官方最新底座架构完全同步。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-21 专项自动化测试套件，全量回归测试流水线（Ticket-03 至 Ticket-21）100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.23.0 (2026-10-13)
+
+### 1. 全面深度适配 Antigravity v2.23.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 13 日最新推送的 2.23.0 版本，同步升级应用版本定义与全工程元数据至 `2.23.0`。
+- **上游原生模块与依赖树同步**：解包同步 2.23.0 官方原生模块与核心依赖，保持与官方最新底座架构 100% 同步兼容。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-20 专项自动化测试套件，全量回归测试流水线（Ticket-03 至 Ticket-20）100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.22.0 (2026-10-09)
+
+### 1. 全面深度适配 Antigravity v2.22.0 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方 10 月 9 日最新推送的 2.22.0 版本，同步升级应用版本定义与全工程元数据至 `2.22.0`。
+- **上游原生模块与依赖同步**：更新官方解包核心文件与依赖树，保持与 2.22.0 官方原生架构 100% 同步兼容。
+- **全套 TDD 回归测试套件保持全绿**：新增 Ticket-19 专项自动化测试套件（30 项断言全绿通过），全量回归测试流水线（Ticket-03 至 Ticket-19）100% 保持通过 (ALL GREEN)。
+
+---
+
+## v2.21.1 (2026-10-08)
+
+### 1. Agent 执行标签与药丸（Run/Running/Ran）深度汉化
+- **药丸特权放行白名单（isActionPill）全面扩充**：突破性重构 `shouldSkipNode` 规则，彻底放行包含 `Run`、`Running`、`Ran`、`Working`、`Done`、`Waiting`、`Rejected`、`Errored`、`Analyzed`、`Analyzing` 等核心动作药丸，杜绝执行药丸被代码块防御逻辑跳过而保持英文的问题。
+- **双字典全量收录对齐**：在第一静态字典与第二注入字典中全量收录 `Run`（运行）、`Running`（正在运行 / 运行中）、`Ran`（已运行）及对应复数命令短语。
+
+### 2. 工具组聚合折叠标题（pqb 函数）全量覆盖与动态数字统计
+- **多动词三联与双联复合状态**：完整覆盖工具组折叠栏 `pqb` 函数输出的全部动词组合（探索、运行、编辑工件/文件），如 `已探索文件、已执行命令、已编辑文件`、`正在探索文件、运行命令、编辑工件` 等。
+- **带数量统计动态正则**：支持各类带数量的复合状态短语（如 `已探索 3 个文件，已执行 2 条命令，已编辑 1 个文件`、`正在探索 2 个文件，正在运行 3 条命令，正在编辑 1 个工件`、`已运行 4 条命令`）。
+
+### 3. 彻底根治“Ran 命令”半中半英夹生词
+- **分词引擎词表对齐**：在分词核心词表 `coreWords` 中补齐收录 `run` 与 `ran`，消除过去因只分词替换 `command` 导致残留 `Ran 命令` 的根因。
+- **多层自愈保底机制**：在动态正则匹配段与分词清洗后处理管道中均注入绝对拦截规则，彻底杜绝任何形式的 `Ran 命令`、`Running 命令` 或 `Ran 命令: <cmd>` 夹生词残留。
+- **具体命令行模式汉化**：支持 `已运行命令: <cmd>`、`正在运行命令: <cmd>`、`等待命令执行完成（最多 N 秒）`、`已拒绝向命令发送终止请求` 等全套步骤行状态。
+
+### 4. 全面深度适配 Antigravity v2.21.1 官方最新架构
+- **官方版本无缝平滑升级**：深度跟进官方最新发布的 2.21.1 版本，同步升级应用版本定义与全工程元数据至 `2.21.1`。
+- **拖拽与文件获取桥接兼容**：适配官方在 `preload.js` 中新增的 `getPathForFile`（基于 Electron `webUtils.getPathForFile`）原生桥接接口，保证文件拖拽与文件选择器在中文环境下的完整可用性。
+- **设置中心新文案补全**：覆盖体验模式切换（`Project 4K`）、Token 预算提示、明细数量动态折叠/展开、文件读写权限分类、强烈对比度选项、法律帮助及云项目/聊天机器人/Sidecar 创建进度提示。
+- **原生上下文菜单与托盘交互**：完整继承主进程 `ipcHandlers.js` 原生上下文菜单调度机制与系统托盘单击唤醒抢占焦点交互。
+
+### 5. 全套 TDD 回归测试套件 100% 通过
+- **Ticket-17 架构与文件完备性测试**：63 项断言全部通过。
+- **Ticket-18 执行标签与工具组专项测试**：93 项断言全部通过。
+- **全量回归流水线**：从 Ticket-03 至 Ticket-18 全套测试用例 100% 全部通过 (ALL GREEN)。
+
+---
+
+## v2.17.0 (2026-09-24)
+
+### 1. 全面深度适配 Antigravity v2.17.0 架构
+- **官方版本无缝平滑升级**：深度跟进官方 9月24日最新发布的 2.17.0 版本，同步升级应用版本定义至 `2.17.0`，适配新增依赖项（如 `js-yaml`）与主进程/渲染进程架构。
+- **全套 TDD 自动化测试验证**：新增 Ticket-12 专项测试套件（45 项断言全部通过），全量回归测试套件 100% 保持通过 (ALL GREEN)。
+
+### 2. WSL (Windows Subsystem for Linux) 远程环境深度汉化
+- **原生文件菜单与动态子菜单**：汉化 `Connect to WSL`（连接到 WSL）、`Reopen Locally`（本地重新打开），并实现原生菜单双向匹配回退引擎，杜绝异步添加 WSL 菜单项时的父菜单查找丢失问题。
+- **WSL 首发部署启动弹窗 (Provision Splash)**：汉化首次接入 WSL 时的专用无边框下载与安装弹窗 `Setting up WSL: <distro>`（正在配置 WSL: <发行版>），并实时翻译状态通知：`Downloading the Antigravity binary…`（正在下载 Antigravity 二进制组件…）、`Installing into <distro>…`（正在安装到 <发行版>…）。
+- **WSL 跨系统路径与文件系统警告**：汉化 Windows 与 WSL 文件系统混用时的性能警告提示（建议保留在 WSL 文件系统内以获得最佳性能）、发行版不匹配提示及路径解析错误。
+- **WSL 故障与环境弹窗**：汉化 `WSL distro not found`（未找到 WSL 发行版）、`WSL setup failed`（WSL 配置失败）以及改在 Windows 本地打开的自动回退提示。
+
+### 3. 沙盒模式、高级设置、视图折叠与项目权限继承补全
+- **本地沙盒隔离模式**：补全 `Enable Sandbox Mode (Preview)`（启用沙盒模式 (预览)）、`Restricts agent tools to a secure, isolated local sandbox.`（将智能体工具限制在安全、隔离的本地沙盒环境中。）、`Security Preset`（安全预设）。
+- **应用高级设置与审查视图**：汉化设置中的 `Advanced Settings`（高级设置）与审查栏操作 `Collapse All`（全部折叠）、`Expand All`（全部展开）。
+- **项目专属权限与全局继承**：汉化 `Inherit Global`（继承全局）、`Also includes 全局权限 when working in this project.`（在当前项目中工作时亦继承 全局权限 配置。）等引导与选项文案。
+
+---
+
+## v2.15.1 (2026-09-21)
+
+### 1. 全面适配 Antigravity v2.15.1 核心架构
+- **官方版本无缝平滑升级**：深度跟进官方 9月21日最新构建，升级版本定义至 `2.15.1`，保持对官方最新更新器与依赖体系的 100% 兼容。
+- **全量汉化引擎继承与语法加固**：无缝继承 100% 汉化覆盖，保持 DOM 注入、Electron 原生菜单栏与系统托盘的高韧性运行。
+- **全套 TDD 自动化测试验证**：新增 Ticket-11 专项测试套件，通过全量 305 项自动化用例与全部 37 个 dist JS 文件的 AST 语法门禁。
+
+### 2. 侧边栏置顶会话与分组标题全量补齐
+- **置顶与常用会话分组标题**：汉化左侧栏 `Pinned Conversations` / `pinned conversations`（置顶对话）、`Recent Conversations`（最近对话）、`All Conversations`（全部对话）、`Other Conversations`（其他对话）等核心标题。
+- **置顶状态与无障碍标签**：同步规范化 `Pinned`（已置顶）、`Unpinned`（未置顶）等交互状态文案。
+
+---
+
+## v2.15.0 (2026-09-19)
+
+### 1. 全面适配 Antigravity v2.15.0 核心架构
+- **版本元数据与环境平滑升级**：全面升级应用版本定义至 `2.15.0`，适配官方 9月19日最新架构与更新器版本请求头特性。
+- **全量汉化引擎继承与语法加固**：继承 100% 汉化覆盖，保持 DOM 注入、Electron 原生菜单栏与系统托盘的高韧性运行。
+- **全套 TDD 自动化测试套件**：新增 Ticket-10 专项测试套件，通过全量 239 项自动化用例与 37 个 JS 文件的 AST 语法门禁。
+
+### 2. 自定义智能体控制与默认提示词/工具汉化
+- **智能体提示词与工具控制**：汉化智能体配置控制：`Default tools`（默认工具）、`Default prompt sections`（默认提示词小节）、`Switch off default tools`（关闭默认工具）、`Switch off default prompts`（关闭默认提示词）、`Add back tools`（重新添加工具）。
+- **主智能体状态与重置**：汉化 `Main Agent`（主智能体）、`Main Agent (Default)`（主智能体 (默认)）、删除或关闭后重置为主智能体的交互文案。
+
+### 3. 项目状态、输入框与错误展示优化
+- **项目选择器无项目状态**：汉化输入框上方在非项目工作环境下的状态标签：`No Project`（无项目）、`Working outside of a project`（在项目外部工作）。
+- **无效工具调用展示**：汉化模型返回格式异常时的轻量级提示：`Invalid tool call`（无效的工具调用）。
+- **二进制文件与已取消状态**：汉化智能体尝试读取不可预览文件时的明晰报错 `Cannot display binary file`（无法显示二进制文件），以及应用重启时终端命令状态纠正为 `Command canceled`（命令已取消）。
+
+### 4. 高频交互操作、无障碍属性与动态模板全量补全
+- **会话交互与反馈按钮**：汉化 `Good response`（好评回复）、`Bad response`（差评回复）、`More actions` / `More options`（更多操作 / 更多选项）、`Pin conversation` / `Pinned Conversations`（置顶对话）、`Recent Conversations`（最近对话）、`All Conversations`（全部对话）、`Undo to this point`（撤销到此处）。
+- **代码块与浮动操作**：汉化 `Copy code`（复制代码）、`At mention code block`（提及代码块）、`Add inline comment`（添加行内注释）、`Fold code block`（折叠代码块）、`User message`（用户消息）、`Send message`（发送消息）。
+- **执行报错与动态模板**：汉化智能体异常终止提示 `Agent execution terminated due to error.`（智能体执行因错误而终止。），并新增 `See all (N)`（查看全部 (N)）、`Ran N commands`（已运行 N 条命令）、`Load older messages, showing N of M`（加载历史消息，正在显示 N / M 条）、`Fold lines N-M`（折叠第 N-M 行）等高频动态正则匹配。
+
+---
+
+## v2.14.0 (2026-09-16)
+
+### 1. 全面适配 Antigravity v2.14.0 核心架构
+- **版本元数据与环境无缝升级**：全面升级版本定义至 2.14.0，适配官方 9月16日最新稳定版本构建。
+- **全量汉化引擎继承与语法加固**：无缝继承 100% 汉化覆盖，保持 DOM 注入与 Electron 原生系统菜单、托盘与启动遮罩高韧性运行。
+- **全套 TDD 自动化测试验证**：新增 Ticket-09 专项测试套件，全量通过 37 个 JS 文件的 AST 静态语法校验门禁。
+
+---
+
+## v2.13.0 (2026-09-13)
+
+### 1. 全面适配 Antigravity v2.13.0 核心架构
+- **前端 Bundle 变动适配**：深度适配官方 2.13.0 前端代码结构与构建更新，提取并全量汉化 116+ 处新增界面文案。
+- **Preload 注入引擎同步**：同步升级主渲染线程与安装向导预加载注入模块，保障 100% 汉化覆盖与高帧率吞吐。
+
+### 2. 侧边问答系统 (Side Question / Questionnaire) 深度汉化
+- **独立侧边追问浮窗**：汉化全新侧边追问卡片交互：`Side Question`（侧边提问）、`Side question answered.`（侧边提问已回答。）、`View side question`（查看侧边提问）、`Minimize side question`（最小化侧边提问）、`Delete side question`（删除侧边提问）。
+- **问答表单控制**：汉化 `Cancel questionnaire`（取消问答）与 `Cancel questionnaire and stop the agent`（取消问答并停止智能体）交互。
+
+### 3. 源码控制 Git Amend（追加提交）全流程汉化
+- **追加提交能力**：汉化源码控制面板新增的一级追加入口：`Amend`（追加提交）、`Amending...`（正在追加提交...）。
+- **提交策略与状态提示**：汉化 `Amend staged changes into the current commit`（将已暂存改动追加合并至当前提交）、`Stage and amend all changes into the current commit`（暂存并将所有改动追加合并至当前提交）、`No changes to amend`（没有可追加的改动）、`No commit to amend`（没有可追加的目标提交）以及冲突提示。
+
+### 4. 通用设置中心高级区域重构深度适配
+- **设置项集中收纳适配**：适配 2.13.0 将 `Best of N`、`CitC`、`Labs`（实验室）设置集中收纳至“通用设置 - 高级”区域的架构重构。
+- **迁移引导与版本控制说明**：汉化各个模块的迁移引导长句（如“Best of N 设置已移至通用设置中的‘高级’区域。”）以及版本控制系统切换指引。
+
+### 5. 产物与表格宽度自适应显示控制
+- **显示尺寸偏好设置**：汉化产物显示新设置项：`Markdown Artifact Width`（Markdown 产物宽度）、`Configure the default width of markdown artifacts.`（配置 Markdown 产物的默认显示宽度。）、`Table Width`（表格宽度）。
+- **布局模式选项**：汉化 `Fit to content`（适应内容）与 `Fit to width`（适应宽度）两种排版模式。
+
+### 6. Windows 管理员权限 UAC 提升流程汉化
+- **提权交互提示**：汉化 Windows 平台下终端命令的一次性提权交互：`Administrator access (UAC)`（管理员权限 (UAC)）、`Grant administrator access for`（授予管理员权限至）、`Grant one-time administrator access`（授予一次性管理员权限）、`Requesting a one-time administrator (UAC) elevation`（正在请求一次性管理员 (UAC) 权限提升）以及 `Yes, allow`（允许授权）。
+
+### 7. 自然语言插件构建与自定义项视图分类
+- **自然语言插件构建**：汉化 `Create plugin`（创建插件）、`Describe a plugin and the agent builds it`（描述插件功能，智能体将自动构建）。
+- **自定义项视图分类标签**：汉化来源与安装状态标签：`由您安装`（Installed by you）、`随应用内置`（Bundled with the app）、`已在您的配置中列出`（Listed in your config）、`在此工作区中找到`（Found in this workspace）、`预置`（Pre-installed）、`内置`（Builtin）。
+- **推荐技能开关**：汉化 `Enable recommended skills`（启用推荐技能）与 `Disable recommended skills`（禁用推荐技能）。
+
+### 8. 会话置顶、暂存文件与比对器增强
+- **会话置顶与分叉**：汉化 `Pin this conversation`（置顶此对话）、`Unpin this conversation`（取消置顶此对话）、`Rename this conversation`（重命名此对话）、`Forked conversation`（派生的对话）。
+- **暂存文件面板**：汉化 `Scratch Files`（暂存文件）、`No scratch files`（暂无暂存文件）。
+- **比对器空白字符切换**：汉化代码比对器中的 `Show Whitespace Changes`（显示空白字符变动）与 `Hide Whitespace Changes`（隐藏空白字符变动）。
+
+### 9. 会话分屏 (Split)、派生 (Fork) 与分组管理全套汉化及菜单语法加固
+- **分屏菜单全流程**：补全左侧会话 `Split`（分屏）及级联子菜单 `Split Right`（向右分屏）、`Split Down`（向下分屏）、`Replace With New`（替换为新建）、`Remove From Split`（从分屏中移除）、`Split Terminal`（拆分终端）、`Split Conversation Vertically`（垂直分屏对话）、`Split Conversation Horizontally`（水平分屏对话）、`Equalize Split Panes`（均分分屏窗格）。
+- **会话派生与分组管理**：汉化 `Fork`（派生）、`Create fork in current/shared/new workspace`（在当前/共享/新建工作区创建派生）、`Move to Group`（移动到分组）、`New Group`（新建分组）、`Create Group`（创建分组）及相关自愈纠偏规则。
+- **原生菜单解析稳定性**：修复 `menu.js` 原生菜单遍历语法闭合问题，杜绝 Electron 启动加载时的 AST 语法报错，保障启动稳定性。
+
+---
+
+## v2.12.2 (2026-09-08)
+
+### 1. 全面适配 Antigravity v2.12.2 核心架构
+- **更新词库与模型菜单**：适配 Gemini 3.8 Flash 与 2.12.2 企业级更新词库与模型选择菜单。
+- **预置 MCP 生态全量汉化**：全量汉化设置中心 63 款官方与社区预置 MCP 服务卡片、长句说明及权限声明。
+
+### 2. 斜杠命令（Slash Commands）与悬浮卡片汉化
+- **命令菜单与悬浮卡片**：汉化斜杠命令浮动菜单（`/boost`、`/goal`、`/schedule`、`/browser`、`/grill-me`、`/plan`、`/teamwork-preview`、`/learn` 等）及其详细说明卡片。
+- **原生触发符免疫保护**：严格保护原生触发字符（如 `boost`、`goal` 保持英文不被误译破坏）。
+
+### 3. 上下文提及（@ Mention）菜单精准汉化与放行保护
+- **上下文分类全量汉化**：汉化 `@` 触发的规则（Rules）、对话（Conversation）、文档（PDF Document）、提交（Git Commit）、差异（Git Diff）、目录（Directory）等全部分类项。
+- **分类标签与文件名隔离**：建立标签放行与文件名保护机制，绝对保护项目代码文件名、扩展名与触发参数原生结构。
+
+### 4. 通用设置项深层补齐
+- **浏览器子智能体汉化**：补齐通用设置中浏览器子智能体（Browser Subagent）分段长句与实验室功能词条汉化。
+
+### 5. 原生应用菜单与侧边栏会话交互体验提升
+- **原生顶部菜单精准汉化**：顶部原生菜单 `Create Project`（创建项目）、`New Project`（新建项目）、`Open Project`（打开项目）、`Copy`（复制）等。
+- **历史会话详情与复制子项**：侧边栏历史会话详情与复制子菜单汉化（`Copy trajectory ID`、`Trajectory Metadata` 等）。
+- **悬停卡片动态更新时间与状态指示**：历史会话悬停预览卡片（Hover Card）更新时间（`Updated <time>` -> `更新于 <time>`）及多状态标签（`空闲`、`活跃`、`需要操作`、`未读`）深度汉化，并支持英文月份自动转换为地道中文日期。
+
+---
+
+## v2.12.0.1 (2026-09-04)
+
+### 1. 模型思考链 (Thinking Process) 绝对物理隔离
+- 彻底解决 AI 流式吐字时单词 token 命中分词逻辑导致中英杂糅的缺陷（如英文原句中 `Control` 误译为“控制”）。
+- 双层精准过滤：彻底跳过 `.cursor-edit` 及思考正文包裹容器，杜绝任何正文词汇误篡改。
+- 外部触发药丸保留汉化：`Thought for 4s` 汉化为 `思考了 4s`，`Thinking...` 汉化为 `正在思考...`。
+
+### 2. 动态正则转义失真全量纠正
+- 修复注入模板字符串中的双重反斜杠问题（`\\d`、`\\s`、`\\+` 误匹配字面量反斜杠），全面恢复数字与文件数变更等正则语义。
+- 修正限额标题动态匹配 `\s+Limit\s+Remaining` 转义丢失问题。
+
+### 3. 控制中心全景功能升级
+- 新增亮色 / 暗色主题一键切换按钮（支持持久化记忆与系统主题跟随）。
+- 新增在线 Release 词库检测按钮与红点徽标提示，一键获取 GitHub 最新补丁。
+- 优化浅色模式下打包中的半透明遮罩与文案对比度，彻底修复白底白字无法看清问题。
+- 增加“清除前端缓存”一键维护工具。

@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.os }} (Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: ['22']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check suite scripts
+        run: node --check scripts/suite.js && node --check scripts/asar-version.js && node --check scripts/check-upstream.js
+
+      - name: Check POSIX shell scripts (Linux)
+        if: runner.os == 'Linux'
+        run: bash -n install.sh uninstall.sh status.sh doctor.sh
+
+      - name: Run suite automated tests
+        run: npm test

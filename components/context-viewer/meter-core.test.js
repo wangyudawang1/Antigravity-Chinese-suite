@@ -1,0 +1,5759 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const {
+  summarize,
+  classifyRequestError,
+  analyzeSteps,
+  measure,
+  calculateReferenceModelCost,
+  resolveEffectivePlanStatus,
+  SUBSCRIPTION_REGIONS_PRESET,
+  findRegionPreset,
+  convertToCNY,
+  getLvlForRange,
+  getDailyModelCost,
+  calculateIntervalCost,
+  parseSemver,
+  compareVersions,
+  filterReleases,
+  findReleaseAsset,
+  isValidExternalUrl,
+  groupModelProduct,
+  detectModelVendor,
+  formatEffortLabel,
+  formatTokensK,
+  isValidSpeedSample,
+  computeMedian,
+  parseSpeedDateRange,
+  summarizeSpeedByModel,
+  summarizeSessionRequestCosts,
+  MAX_SPEED_SAMPLES_PER_MODEL
+} = require('./meter-core');
+
+test('all-history speed compares more than 200 samples and custom dates are inclusive', () => {
+  const date = (day, hour = 0) => +new Date(2026, 10, day, hour);
+  const model = { status: 'final', modelExactId: 'gemini-3.8-flash', outputTokens: 200, durationSec: 5 };
+  const calls = Array.from({ length: 251 }, (_, i) => ({
+    ...model, callId: `sample-${i}`, timestamp: i < 250 ? date(23, 15) + i : date(24)
+  }));
+  const range = parseSpeedDateRange({ start: '2026-11-23', end: '2026-11-23' });
+  assert.equal(range.startMs, date(23));
+  assert.equal(range.endMs, date(24));
+  assert.equal(parseSpeedDateRange({ start: '2026-11-31', end: '2026-12-01' }), null);
+  assert.equal(summarizeSpeedByModel(calls, { days: 'all', fullHistory: true })[0].count, 251);
+  assert.equal(summarizeSpeedByModel(calls, { ...range, fullHistory: true })[0].count, 250);
+  assert.equal(summarizeSpeedByModel(calls, { days: '1', nowMs: date(24, 16), calendarDays: true, fullHistory: true })[0].count, 1);
+});
+
+test('request cost sums known rates and reports cache savings and unavailable prices separately', () => {
+  const known = { model: 'gemini-3.8-flash', inputTokens: 1000, cacheReadTokens: 2000, outputTokens: 100, status: 'final' };
+  const unknown = { ...known, model: 'unpriced-test-model' };
+  const summary = summarizeSessionRequestCosts([known, unknown, { ...known, status: 'streaming' }]);
+  assert.equal(summary.rows.length, 2);
+  assert.equal(summary.unpriced, 1);
+  assert.equal(summary.rows[0].cache, 2000);
+  assert.ok(summary.costUSD > 0);
+  assert.ok(summary.savingsUSD > 0);
+  assert.equal(summary.savingsRatio, summary.savingsUSD / (summary.costUSD + summary.savingsUSD));
+  assert.equal(summary.rows[1].costUSD, null);
+  assert.equal(summary.rows[1].savingsUSD, null);
+});
+const entry = (usage, context = {}) => ({ chatModel: { usage, chatStartMetadata: { contextWindowMetadata: context } } });
+const exceeded = 'INVALID_ARGUMENT (code 400): The input token count exceeds the maximum number of tokens allowed 1048576.';
+test('cache counted once, thinking not counted twice, backend budget preserved', () => {
+  const d = summarize(entry({ inputTokens: '1000', cacheReadTokens: '8000', outputTokens: '1000', thinkingOutputTokens: '500' }, { maxContextTokens: 256000 }));
+  assert.equal(d.actual, 10000); assert.equal(d.budget, 256000); assert.equal(d.serviceLimit, null); assert.equal(d.percent, 10000 / 256000 * 100);
+});
+test('failed upload with 127117 estimate overrides a previous successful retry and suppresses percent', () => {
+  const d = entry({ inputTokens: 9000 }, { estimatedTokensUsed: 127117, maxContextTokens: 256000 });
+  d.chatModel.retryInfos = [{ usage: { inputTokens: 9000 } }, { error: exceeded, usage: { model: 'gemini' } }];
+  const s = summarize(d);
+  assert.equal(s.exceeded, true); assert.equal(s.actual, null); assert.equal(s.estimate, 127117); assert.equal(s.serviceLimit, 1048576); assert.equal(s.percent, null); assert.equal(s.status, 'exceeded');
+});
+test('Go timeout error "context deadline exceeded" is classified as network, not context overflow', () => {
+  const d = entry({ inputTokens: 9000 });
+  d.chatModel.retryInfos = [{ usage: { inputTokens: 9000 } }, { error: 'request failed: stream idle timeout (5m0s): context deadline exceeded', usage: { model: 'gemini' } }];
+  const s = summarize(d);
+  assert.equal(s.exceeded, false); assert.equal(s.network, true); assert.equal(s.status, 'network'); assert.equal(s.serviceLimit, null);
+});
+test('gateway EOF ("Post ...: EOF") is network, not context overflow', () => {
+  const d = entry({ inputTokens: 9000 });
+  d.chatModel.retryInfos = [{ usage: { inputTokens: 9000 } }, { error: 'request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF', usage: { model: 'gemini' } }];
+  const s = summarize(d);
+  assert.equal(s.exceeded, false); assert.equal(s.network, true); assert.equal(s.status, 'network');
+});
+test('true overflow error is still exceeded even when phrased with generic words', () => {
+  const d = entry({ inputTokens: 9000 });
+  d.chatModel.retryInfos = [{ usage: { inputTokens: 9000 } }, { error: exceeded, usage: { model: 'gemini' } }];
+  const s = summarize(d);
+  assert.equal(s.exceeded, true); assert.equal(s.network, false);
+});
+test('Gemini 4 preserves the runtime compression budget for display names and model identifiers', () => {
+  const g4 = summarize({ chatModel: { modelDisplayName: 'Gemini 4 Argon (Medium)', usage: { inputTokens: 40000 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } } } });
+  assert.equal(g4.budget, 256000);
+  assert.equal(g4.percent, 40000 / 256000 * 100);
+  const g4byId = summarize({ chatModel: { model: 'gemini-4-argon-high', usage: { inputTokens: 40000 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } } } });
+  assert.equal(g4byId.budget, 256000);
+  const other = summarize({ chatModel: { modelDisplayName: 'Gemini 3.8 Flash (High)', usage: { inputTokens: 40000 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } } } });
+  assert.equal(other.budget, 256000);
+  const unnamed = summarize({ chatModel: { usage: { inputTokens: 40000 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } } } });
+  assert.equal(unnamed.budget, 256000);
+});
+
+test('Argon uses expanded runtime budgets and keeps missing budgets unknown', () => {
+  for (const budget of [512000, 983040, undefined]) {
+    const metadata = entry({ inputTokens: 513593 }, { maxContextTokens: budget });
+    metadata.chatModel.model = 'gemini-4-argon-trial';
+    const result = summarize(metadata);
+    assert.equal(result.budget, budget ?? null);
+    assert.equal(result.percent, budget ? 513593 / budget * 100 : null);
+  }
+});
+test('estimated input never produces a safe remaining percent or invented million limit', () => {
+  const s = summarize(entry({}, { estimatedTokensUsed: 127117 }));
+  assert.equal(s.percent, null); assert.equal(s.budget, null); assert.equal(s.serviceLimit, null); assert.equal(s.status, 'estimated');
+});
+test('output only is not evidence for full input context', () => assert.equal(summarize(entry({ outputTokens: 100 })).actual, null));
+test('model without chat metadata remains unknown', () => assert.equal(summarize({}), null));
+test('canonical upload and inline preview are not counted as separate attachments', () => {
+  const s = analyzeSteps([{ userInput: { userResponse: 'hello', items: [{ text: 'hello', media: { mimeType: 'image/png', inlineData: 'preview' } }], media: [{ uri: 'C:/a.xlsx', mimeType: 'application/xlsx', description: 'a.xlsx' }] } }]);
+  assert.equal(s.media.length, 1); assert.equal(s.groups.user.chars, 5);
+});
+test('full history keeps old messages and repeated upload occurrences; duplicate rendered reply counted once', () => {
+  const media = [{ uri: 'C:/a.xlsx', mimeType: 'application/xlsx' }];
+  const s = analyzeSteps([{ userInput: { userResponse: 'one', media } }, { plannerResponse: { response: 'answer', modifiedResponse: 'answer', thinking: 'thought' } }, { checkpoint: { sessionSummary: 'summary' } }, { userInput: { userResponse: 'two', media } }, { generic: { result: 'tool output' } }]);
+  assert.equal(s.groups.user.chars, 6); assert.equal(s.groups.assistant.chars, 6); assert.equal(s.media[0].references, 2); assert.equal(s.groups.summaries.chars, 7); assert.ok(s.groups.tools.chars > 0);
+});
+test('old error cleared after later user/assistant steps', () => {
+  const error = { errorMessage: { error: { shortError: exceeded } } };
+  assert.ok(analyzeSteps([{ userInput: { userResponse: 'a' } }, error]).currentError);
+  assert.equal(analyzeSteps([error, { userInput: { userResponse: 'b' } }]).currentError, null);
+});
+test('Chinese and non-BMP Unicode characters measured without treating binary byte sizes as tokens', () => {
+  const s = measure('中文😀0'); assert.equal(s.chars, 4); assert.equal(s.bytes, 11); assert.ok(s.high >= s.low);
+});
+test('model output speed and duration calculated accurately from timeToFirstToken and streamingDuration', () => {
+  const d = summarize({
+    chatModel: {
+      timeToFirstToken: '8.395092700s',
+      streamingDuration: '12.902455200s',
+      usage: {
+        inputTokens: '4335',
+        outputTokens: '2388',
+        thinkingOutputTokens: '1260',
+        responseOutputTokens: '1128'
+      }
+    }
+  });
+  assert.ok(d.speed);
+  assert.equal(d.speed.duration, 21.30);
+  assert.equal(d.speed.ttft, 8.40);
+  assert.equal(d.speed.streamingSec, 12.90);
+  assert.equal(d.speed.outputTokens, 2388);
+  assert.equal(d.speed.thinkingTokens, 1260);
+  assert.equal(d.speed.responseTokens, 1128);
+  assert.equal(d.speed.tps, 112.1);
+  assert.equal(d.speed.streamingTps, 185.1);
+});
+
+test('inline attachments and images are fully counted and parsed instead of unknown', async () => {
+  const { scanFiles } = require('./meter-collector');
+  const zlib = require('zlib');
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(100, 0); ihdr.writeUInt32BE(80, 4);
+  ihdr[8] = 8; ihdr[9] = 2;
+  const idat = zlib.deflateSync(Buffer.alloc(80 * (100 * 3 + 1)));
+  const pngBuf = Buffer.concat([
+    Buffer.from('89504e470d0a1a0a', 'hex'),
+    Buffer.from([0, 0, 0, 13]), Buffer.from('IHDR'), ihdr, Buffer.alloc(4),
+    Buffer.from([0, 0, 0, idat.length]), Buffer.from('IDAT'), idat, Buffer.alloc(4),
+    Buffer.from([0, 0, 0, 0]), Buffer.from('IEND'), Buffer.alloc(4)
+  ]);
+  const base64Png = pngBuf.toString('base64');
+
+  const s = analyzeSteps([
+    {
+      plannerResponse: {
+        response: 'generated file',
+        attachment: {
+          mimeType: 'image/png',
+          description: 'result.png',
+          inlineData: { data: base64Png, mimeType: 'image/png' }
+        }
+      }
+    }
+  ]);
+
+  assert.equal(s.media.length, 1);
+  assert.equal(s.media[0].name, 'result.png');
+  assert.ok(s.media[0].inlineData);
+
+  const scanned = await scanFiles(s.media);
+  assert.equal(scanned.length, 1);
+  assert.equal(scanned[0].status, 'parsed');
+  assert.equal(scanned[0].width, 100);
+  assert.equal(scanned[0].height, 80);
+  assert.equal(scanned[0].low, 258);
+  assert.deepEqual(scanned[0].unknownParts, []);
+});
+// ============================================================================
+// 第三阶段测试：API 等值计价、长上下文阈值、日期切换与套餐解析
+// ============================================================================
+const {
+  GEMINI_PRICING_TABLE,
+  normalizeModelId,
+  calculateRequestApiCost,
+  summarizeApiCost,
+  parseUserPlanStatus
+} = require('./meter-core');
+
+test('3.8 Flash API pricing accurately matches reference fixtures: $4.575 today and $9.15 in 2027', () => {
+  const req2026 = {
+    model: 'Gemini 3.8 Flash (High)',
+    input_tokens: 1000000,
+    cache_read_tokens: 1000000,
+    output_tokens: 1000000,
+    date: '2026-11-08'
+  };
+  const res2026 = calculateRequestApiCost(req2026);
+  assert.equal(res2026.isPriced, true);
+  assert.equal(res2026.modelKey, 'gemini-3.8-flash');
+  // (1 * 0.75 + 1 * 0.075 + 1 * 3.75) = 4.575
+  assert.equal(res2026.costUSD, 4.575);
+
+  const req2027 = {
+    model: 'gemini-3.8-flash',
+    input_tokens: 1000000,
+    cache_read_tokens: 1000000,
+    output_tokens: 1000000,
+    date: '2027-01-02'
+  };
+  const res2027 = calculateRequestApiCost(req2027);
+  assert.equal(res2027.isPriced, true);
+  // (1 * 1.50 + 1 * 0.15 + 1 * 7.50) = 9.15
+  assert.equal(res2027.costUSD, 9.15);
+});
+
+test('3.1 Pro Preview shifts tier at 200K prompt threshold on single-request basis', () => {
+  // 单次 prompt <= 200K (低档: input $2.00, output $12.00, cache $0.20)
+  const reqLow = {
+    model: 'Gemini 3.1 Pro Preview',
+    input_tokens: 150000,
+    cache_read_tokens: 50000, // totalPrompt = 200000
+    output_tokens: 10000,
+    date: '2026-11-08'
+  };
+  const resLow = calculateRequestApiCost(reqLow);
+  assert.equal(resLow.isPriced, true);
+  // (0.15 * 2.00 + 0.05 * 0.20 + 0.01 * 12.00) = 0.30 + 0.01 + 0.12 = 0.43
+  assert.equal(resLow.costUSD, 0.43);
+
+  // 单次 prompt = 200001 (高档: input $4.00, output $18.00, cache $0.40)
+  const reqHigh = {
+    model: 'Gemini 3.1 Pro Preview',
+    input_tokens: 150001,
+    cache_read_tokens: 50000, // totalPrompt = 200001
+    output_tokens: 10000,
+    date: '2026-11-08'
+  };
+  const resHigh = calculateRequestApiCost(reqHigh);
+  assert.equal(resHigh.isPriced, true);
+  // (0.150001 * 4.00 + 0.05 * 0.40 + 0.01 * 18.00) = 0.600004 + 0.02 + 0.18 = 0.800004
+  assert.equal(resHigh.costUSD, 0.800004);
+});
+
+test('output tokens already include thinking tokens and are not double-counted', () => {
+  const req = {
+    model: 'gemini-3.8-flash',
+    input_tokens: 100000,
+    cache_read_tokens: 0,
+    output_tokens: 20000, // 已含 thinking
+    thinking_output_tokens: 10000,
+    date: '2026-11-08'
+  };
+  const res = calculateRequestApiCost(req);
+  assert.equal(res.isPriced, true);
+  // (0.1 * 0.75 + 0.02 * 3.75) = 0.075 + 0.075 = 0.15
+  assert.equal(res.costUSD, 0.15);
+});
+
+test('unknown model or legacy archive requests are labeled unpriced without inventing $0 cost', () => {
+  const requests = [
+    { model: 'gemini-3.8-flash', input_tokens: 1000000, output_tokens: 1000000, cache_read_tokens: 0, date: '2026-11-08' }, // $4.50
+    { model: 'unknown-experimental-model', input_tokens: 500000, output_tokens: 200000, cache_read_tokens: 0, date: '2026-11-08' }
+  ];
+  const summary = summarizeApiCost(requests);
+  assert.equal(summary.pricedRequestsCount, 1);
+  assert.equal(summary.unpricedRequestsCount, 1);
+  assert.equal(summary.pricedCostUSD, 4.5);
+  assert.equal(summary.pricedTokens, 2000000);
+  assert.equal(summary.unpricedTokens, 700000);
+  assert.ok(summary.coveragePercent < 100);
+});
+
+test('parseUserPlanStatus extracts Pro plan and credits correctly while keeping region and actual paid price unknown', () => {
+  const fixture = {
+    userStatus: {
+      name: 'Example User',
+      email: 'test@example.com',
+      planStatus: {
+        planInfo: {
+          teamsTier: 'TEAMS_TIER_PRO',
+          planName: 'Pro',
+          monthlyPromptCredits: 50000,
+          monthlyFlowCredits: 150000
+        },
+        availablePromptCredits: 500,
+        availableFlowCredits: 100
+      },
+      userTier: {
+        id: 'g1-pro-tier',
+        name: 'Google AI Pro'
+      }
+    }
+  };
+  const plan = parseUserPlanStatus(fixture);
+  assert.equal(plan.status, 'identified');
+  assert.equal(plan.tierKey, 'pro');
+  assert.equal(plan.tierName, 'Google AI Pro');
+  assert.equal(plan.tierId, 'g1-pro-tier');
+  assert.equal(plan.teamsTier, 'TEAMS_TIER_PRO');
+  assert.equal(plan.planName, 'Pro');
+  assert.equal(plan.email, 'test@example.com');
+  assert.equal(plan.officialPriceMonthly, 19.99);
+  assert.equal(plan.actualPricePaid, null);
+  assert.ok(plan.region.includes('未知'));
+  assert.equal(plan.promptCredits.available, 500);
+  assert.equal(plan.promptCredits.monthly, 50000);
+  assert.equal(plan.flowCredits.available, 100);
+  assert.equal(plan.flowCredits.monthly, 150000);
+});
+
+test('parseUserPlanStatus handles unknown or empty payload safely without throwing', () => {
+  const emptyPlan = parseUserPlanStatus(null);
+  assert.equal(emptyPlan.status, 'unidentified');
+  assert.equal(emptyPlan.tierName, '未知');
+  assert.equal(emptyPlan.actualPricePaid, null);
+});
+const { isCompanionOrTempFile, collectTokenHistoryAsync, recordModelCalls } = require('./meter-collector');
+
+test('isCompanionOrTempFile detects SQLite companion files and temporary locks', () => {
+  assert.equal(isCompanionOrTempFile('session.db-wal'), true);
+  assert.equal(isCompanionOrTempFile('session.db-shm'), true);
+  assert.equal(isCompanionOrTempFile('session.db-journal'), true);
+  assert.equal(isCompanionOrTempFile('session.tmp'), true);
+  assert.equal(isCompanionOrTempFile('session.lock'), true);
+  assert.equal(isCompanionOrTempFile('session.pb'), false);
+  assert.equal(isCompanionOrTempFile('session.db'), false);
+});
+
+test('collectTokenHistoryAsync runs dual-source scan and returns valid data structures in isolated directory', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-meter-test-ag-'));
+  const tempCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-meter-test-cli-'));
+  try {
+    fs.mkdirSync(path.join(tempDir, 'brain', 'sample_desktop'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'conversations'), { recursive: true });
+    fs.mkdirSync(path.join(tempCliDir, 'brain', 'sample_cli'), { recursive: true });
+    fs.mkdirSync(path.join(tempCliDir, 'conversations'), { recursive: true });
+
+    // 写入模拟 desktop 对话 transcript.jsonl
+    const desktopEvent = {
+      created_at: '2026-11-08T10:00:00Z',
+      model: 'gemini-3.8-flash',
+      chatModel: {
+        usage: { inputTokens: 5000, outputTokens: 500, cacheReadTokens: 1000 }
+      }
+    };
+    fs.writeFileSync(path.join(tempDir, 'brain', 'sample_desktop', 'transcript.jsonl'), JSON.stringify(desktopEvent) + '\n', 'utf8');
+
+    // 写入模拟 cli 对话 transcript.jsonl
+    const cliEvent = {
+      created_at: '2026-11-08T11:00:00Z',
+      model: 'gemini-3.8-flash',
+      chatModel: {
+        usage: { inputTokens: 2000, outputTokens: 200, cacheReadTokens: 500 }
+      }
+    };
+    fs.writeFileSync(path.join(tempCliDir, 'brain', 'sample_cli', 'transcript.jsonl'), JSON.stringify(cliEvent) + '\n', 'utf8');
+
+    const data = await collectTokenHistoryAsync({
+      force: true,
+      agDir: tempDir,
+      agCliDir: tempCliDir,
+      userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } }
+    });
+    assert.ok(data);
+    assert.ok(data.sources);
+    assert.equal(data.sources.desktop.transcriptsCount, 1);
+    assert.equal(data.sources.cli.transcriptsCount, 1);
+    assert.ok(data.dailyMapBySource);
+    assert.ok(data.dailyMapBySource.all);
+    assert.ok(data.dailyMapBySource.desktop);
+    assert.ok(data.dailyMapBySource.cli);
+    assert.equal(data.planStatus.tierName, 'Google AI Pro');
+    assert.ok(data.costEstimate);
+    assert.ok(data.costEstimate.pricedRequestsCount >= 2);
+    assert.equal(data.costEstimate.unpricedRequestsCount, 0);
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(tempCliDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('summarizeApiCost with unpriced requests returns 0% coverage and unpriced reasons without inventing 100%', () => {
+  const res = summarizeApiCost([{ model: '', input_tokens: 1000, output_tokens: 200 }]);
+  assert.equal(res.pricedRequestsCount, 0);
+  assert.equal(res.unpricedRequestsCount, 1);
+  assert.equal(res.coveragePercent, 0);
+  assert.equal(res.pricedCostUSD, 0);
+  assert.equal(res.unpricedReasons.missingModel, 1);
+});
+
+const { parseGeneratorCall } = require('./meter-core');
+
+test('parseGeneratorCall handles modelDisplayName, responseModel and stepIndices cleanly', () => {
+  const row = {
+    stepIndices: [10, 11],
+    chatModel: {
+      modelDisplayName: 'Gemini 3.8 Flash (High)',
+      responseModel: 'gemini-3.8-flash-n',
+      usage: {
+        inputTokens: '10000',
+        cacheReadTokens: '20000',
+        outputTokens: '1000',
+        thinkingOutputTokens: '400',
+        responseId: 'resp-test-123'
+      }
+    }
+  };
+  const call = parseGeneratorCall(row, 'test-convo-id', 'desktop');
+  assert.ok(call);
+  assert.equal(call.callId, 'resp-test-123');
+  assert.equal(call.modelKey, 'gemini-3.8-flash');
+  assert.equal(call.inputTokens, 10000);
+  assert.equal(call.cacheTokens, 20000);
+  assert.equal(call.outputTokens, 1000);
+  assert.equal(call.status, 'final');
+  assert.equal(call.isEstimated, false);
+  // (0.01 * 0.75 + 0.02 * 0.075 + 0.001 * 3.75) = 0.0075 + 0.0015 + 0.00375 = 0.01275
+  assert.equal(call.costUSD, 0.01275);
+});
+
+test('cache tokens are preserved through parseGeneratorCall and summarizeApiCost matches $0.01275 fixture', () => {
+  const row = {
+    chatModel: {
+      responseModel: 'gemini-3.8-flash',
+      usage: {
+        inputTokens: 10000,
+        cacheReadTokens: 20000,
+        outputTokens: 1000,
+        responseId: 'call-cache-test'
+      }
+    }
+  };
+  const call = parseGeneratorCall(row, 'convo-1', 'desktop');
+  assert.equal(call.costUSD, 0.01275);
+  // 单条账本记录再经由 summarizeApiCost 重新计算，费用必须仍为 0.01275 美元，绝不降为 0.0112 美元
+  const summary = summarizeApiCost([call]);
+  assert.equal(summary.pricedCostUSD, 0.0128); // toFixed(4)
+  assert.equal(summary.pricedTokens, 31000);
+  assert.equal(summary.byModel['gemini-3.8-flash'].costUSD, 0.01275);
+});
+
+test('prompt cache tokens trigger tiered pricing threshold accurately', () => {
+  // gemini-3.1-pro-preview: 阈值 200,000 prompt tokens
+  // input: 150,000, cacheRead: 60,000 => totalPrompt = 210,000 (> 200,000 触发高档费率)
+  const req = {
+    model: 'gemini-3.1-pro-preview',
+    inputTokens: 150000,
+    cacheTokens: 60000,
+    outputTokens: 1000
+  };
+  const res = calculateRequestApiCost(req);
+  assert.equal(res.isPriced, true);
+  assert.equal(res.matchedTier.minPromptTokens, 200001);
+  // 高档 input 4.00/M, cacheRead 0.40/M, output 18.00/M
+  // (150000 * 4 + 60000 * 0.4 + 1000 * 18) / 1000000 = (600000 + 24000 + 18000) / 1000000 = 0.642
+  assert.equal(res.costUSD, 0.642);
+});
+
+test('parseGeneratorCall preserves created_at date and does not replace historical date with today', () => {
+  const row = {
+    created_at: '2026-10-20T08:30:00Z',
+    chatModel: {
+      model: 'gemini-3.8-flash',
+      usage: { inputTokens: 100, outputTokens: 50, responseId: 'call-hist-date' }
+    }
+  };
+  const call = parseGeneratorCall(row, 'convo-hist', 'desktop');
+  assert.equal(call.date, '2026-10-20');
+  assert.equal(call.created_at, '2026-10-20T08:30:00Z');
+});
+
+test('parseUserPlanStatus treats empty status as unidentified and handles Ultra with unknown sub-tier without hardcoded lowest rate', () => {
+  const emptyRes = parseUserPlanStatus({});
+  assert.equal(emptyRes.status, 'unidentified');
+  assert.equal(emptyRes.tierName, '未知');
+  assert.equal(emptyRes.officialPriceMonthly, null);
+
+  const ultraRes = parseUserPlanStatus({ userStatus: { userTier: { name: 'Google AI Ultra' } } });
+  assert.equal(ultraRes.status, 'identified');
+  assert.equal(ultraRes.tierDisplayName || ultraRes.tierName, 'Google AI Ultra');
+  assert.equal(ultraRes.officialPriceMonthly, null);
+  assert.ok(ultraRes.priceRangeNote);
+});
+
+test('recordModelCalls calibrates from partial streaming usage to final usage and preserves original date', () => {
+  const { recordModelCalls, loadPricingLedger } = require('./meter-collector');
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-ledger-test-'));
+  try {
+    const callPartial = {
+      callId: 'call-calibrate-1',
+      model: 'gemini-3.8-flash',
+      modelKey: 'gemini-3.8-flash',
+      inputTokens: 1000,
+      cacheTokens: 0,
+      outputTokens: 200,
+      totalTokens: 1200,
+      status: 'streaming',
+      isPriced: true,
+      costUSD: 0.0015,
+      date: '2026-10-25'
+    };
+    recordModelCalls([callPartial], { agDir: tempDir });
+    let ledger = loadPricingLedger(tempDir);
+    assert.equal(ledger.calls['call-calibrate-1'].outputTokens, 200);
+
+    const callFinal = {
+      callId: 'call-calibrate-1',
+      model: 'gemini-3.8-flash',
+      modelKey: 'gemini-3.8-flash',
+      inputTokens: 1000,
+      cacheTokens: 0,
+      outputTokens: 400,
+      totalTokens: 1400,
+      status: 'final',
+      isPriced: true,
+      costUSD: 0.00225,
+      date: '2026-10-25'
+    };
+    recordModelCalls([callFinal], { agDir: tempDir });
+    ledger = loadPricingLedger(tempDir);
+    assert.equal(ledger.calls['call-calibrate-1'].outputTokens, 400);
+    assert.equal(ledger.calls['call-calibrate-1'].status, 'final');
+    assert.equal(ledger.calls['call-calibrate-1'].date, '2026-10-25');
+
+    // 迟到旧数据 (如回退为 200 outputTokens) 绝不能覆盖已完成的 400
+    const callStale = {
+      callId: 'call-calibrate-1',
+      model: 'gemini-3.8-flash',
+      modelKey: 'gemini-3.8-flash',
+      inputTokens: 1000,
+      cacheTokens: 0,
+      outputTokens: 200,
+      totalTokens: 1200,
+      status: 'final',
+      isPriced: true,
+      costUSD: 0.0015,
+      date: '2026-10-25'
+    };
+    recordModelCalls([callStale], { agDir: tempDir });
+    ledger = loadPricingLedger(tempDir);
+    assert.equal(ledger.calls['call-calibrate-1'].outputTokens, 400);
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('install script exposes recordCalls in preload and includes local-api in bundled additions', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const installSrc = fs.readFileSync(path.join(__dirname, 'install.js'), 'utf8');
+  assert.ok(installSrc.includes('recordCalls: (calls) => electron_1.ipcRenderer.invoke("context-meter:record-calls", calls)'));
+  assert.ok(installSrc.includes("'local-api.js'"));
+});
+
+test('calculateReferenceModelCost: Gemini 3.8 Flash 2026-11-08 fixture matches $211.64 and enforces cache discount', () => {
+  // 提示词中的标准验算 fixture:
+  // input=75639212, output=8354728, cache=1647757871
+  // input/1M×0.75 + output/1M×3.75 + cache/1M×0.075 = 211.641479
+  const res = calculateReferenceModelCost({
+    inputTokens: 75639212,
+    outputTokens: 8354728,
+    cacheTokens: 1647757871
+  }, 'gemini-3.8-flash', { pricingDate: '2026-11-08' });
+
+  assert.equal(res.modelKey, 'gemini-3.8-flash');
+  assert.equal(res.formattedTotalUSD, 211.64);
+  assert.equal(res.inputCostUSD, 56.7294);
+  assert.equal(res.cacheCostUSD, 123.5818);
+  assert.equal(res.outputCostUSD, 31.3302);
+  assert.equal(res.totalCostUSD, 211.6415);
+  // 严禁将 16.47 亿 cache 按普通输入价 0.75 算成所谓的“节省”
+  assert.notEqual(res.cacheCostUSD, (1647757871 * 0.75) / 1000000);
+});
+
+test('calculateReferenceModelCost: unpriced total without breakdown is labeled unpriced without inventing input/output split', () => {
+  const res = calculateReferenceModelCost({ totalTokens: 1000000 }, 'gemini-3.8-flash');
+  assert.equal(res.hasBreakdown, false);
+  assert.equal(res.totalCostUSD, 0);
+  assert.equal(res.unpricedTokens, 1000000);
+  assert.equal(res.isSimulation, false);
+});
+
+test('calculateReferenceModelCost: hybrid mode subtracts known usage without double counting', () => {
+  const res = calculateReferenceModelCost({
+    inputTokens: 100000,
+    outputTokens: 10000,
+    cacheTokens: 200000
+  }, 'gemini-3.8-flash', {
+    mode: 'unpriced_only',
+    knownUsage: {
+      inputTokens: 50000,
+      outputTokens: 5000,
+      cacheTokens: 100000,
+      costUSD: 0.05
+    }
+  });
+
+  assert.ok(res.hybrid);
+  assert.equal(res.hybrid.knownCostUSD, 0.05);
+  // residual: input=50000 ($0.0375), cache=100000 ($0.0075), output=5000 ($0.01875) => 0.06375
+  assert.equal(res.hybrid.unpricedResidualCostUSD, 0.0638);
+  assert.equal(res.hybrid.combinedTotalUSD, 0.1138);
+});
+
+test('resolveEffectivePlanStatus: actual live values strictly take priority over custom settings', () => {
+  const live = {
+    status: 'identified',
+    tierKey: 'pro',
+    tierName: 'Google AI Pro',
+    email: 'user@example.com',
+    region: '日本 (JP)',
+    actualPricePaid: 0, // 0 元促销是有效实际值
+    officialPriceMonthly: 19.99,
+    currency: 'USD',
+    billingCycle: '月付'
+  };
+
+  const custom = {
+    email: 'user@example.com',
+    region: '中国香港 (HK)',
+    actualPricePaid: 19.99,
+    customNote: '促销备注'
+  };
+
+  const effective = resolveEffectivePlanStatus(live, custom);
+  // 实际值优先：地区为日本，实付为 0
+  assert.equal(effective.region, '日本 (JP)');
+  assert.equal(effective.regionSource, 'live');
+  assert.equal(effective.actualPricePaid, 0);
+  assert.equal(effective.priceSource, 'live');
+  assert.equal(effective.customNote, '促销备注'); // 备注仅作为展示旁注
+});
+
+test('resolveEffectivePlanStatus: fallback to custom when live is unknown and enforces account isolation', () => {
+  const live = {
+    status: 'identified',
+    tierKey: 'pro',
+    tierName: 'Google AI Pro',
+    email: 'current@example.com',
+    region: '未知',
+    actualPricePaid: null,
+    officialPriceMonthly: 19.99
+  };
+
+  // 1) 账号匹配时：采用自定义手填
+  const customMatched = {
+    email: 'current@example.com',
+    region: '新加坡 (SG)',
+    actualPricePaid: 21.50,
+    currency: 'USD',
+    billingCycle: '月付'
+  };
+  const effMatched = resolveEffectivePlanStatus(live, customMatched);
+  assert.equal(effMatched.region, '新加坡 (SG)');
+  assert.equal(effMatched.regionSource, 'custom');
+  assert.equal(effMatched.actualPricePaid, 21.5);
+  assert.equal(effMatched.priceSource, 'custom');
+
+  // 2) 账号不匹配时：绝不继承其他账号设置
+  const customOtherAccount = {
+    email: 'other@example.com',
+    region: '新加坡 (SG)',
+    actualPricePaid: 21.50
+  };
+  const effUnmatched = resolveEffectivePlanStatus(live, customOtherAccount);
+  assert.equal(effUnmatched.region, '未知');
+  assert.equal(effUnmatched.regionSource, 'unknown');
+  assert.equal(effUnmatched.actualPricePaid, null);
+  assert.equal(effUnmatched.priceSource, 'official_reference');
+});
+
+test('quarantineSyntheticCalls: isolates synthetic test items into quarantine file leaving production ledger clean', () => {
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const {
+    quarantineSyntheticCalls,
+    loadPricingLedger,
+    savePricingLedger,
+    recordModelCalls
+  } = require('./meter-collector');
+
+  const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-quarantine-test-'));
+  try {
+    const mockCalls = {
+      test_real_desktop_response_001: {
+        callId: 'test_real_desktop_response_001',
+        source: 'desktop',
+        cascadeId: 'desktop-session-verify',
+        costUSD: 0.0128
+      },
+      call_real_production_user_002: {
+        callId: 'call_real_production_user_002',
+        source: 'desktop',
+        cascadeId: 'real-session-user',
+        costUSD: 0.05
+      }
+    };
+    savePricingLedger({ version: '1.0.0', calls: mockCalls }, testDir);
+
+    const res = quarantineSyntheticCalls(testDir);
+    assert.equal(res.quarantinedCount, 1);
+
+    const cleanedLedger = loadPricingLedger(testDir);
+    assert.equal(Object.keys(cleanedLedger.calls).length, 1);
+    assert.ok(cleanedLedger.calls['call_real_production_user_002']);
+    assert.equal(cleanedLedger.calls['test_real_desktop_response_001'], undefined);
+
+    const qPath = path.join(testDir, 'pricing_ledger_quarantine.json');
+    assert.ok(fs.existsSync(qPath));
+    const qData = JSON.parse(fs.readFileSync(qPath, 'utf8'));
+    assert.ok(qData.calls['test_real_desktop_response_001']);
+  } finally {
+    try { fs.rmSync(testDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('calculateReferenceModelCost: hybrid mode with full coverage has zero residual and matches priced cost', () => {
+  // 混合模式边界：已知用量完全覆盖总用量时，残差必须为 0，且综合费用严格等于已知费用
+  const totalTotals = {
+    inputTokens: 10000,
+    cacheTokens: 20000,
+    outputTokens: 1000,
+    totalTokens: 31000
+  };
+  const known = {
+    byCategory: {
+      inputTokens: 10000,
+      cacheTokens: 20000,
+      outputTokens: 1000
+    },
+    costUSD: 0.01275
+  };
+
+  const res = calculateReferenceModelCost(totalTotals, 'gemini-3.8-flash', {
+    mode: 'unpriced_only',
+    knownUsage: known
+  });
+
+  assert.ok(res.hybrid);
+  assert.equal(res.hybrid.unpricedResidualTokens, 0);
+  assert.equal(res.hybrid.unpricedResidualCostUSD, 0);
+  assert.equal(res.hybrid.combinedTotalUSD, 0.01275); // 全覆盖残差为0，严格等于已识别金额
+  assert.equal(res.hybrid.residualTokensBreakdown.input, 0);
+  assert.equal(res.hybrid.residualTokensBreakdown.cache, 0);
+  assert.equal(res.hybrid.residualTokensBreakdown.output, 0);
+});
+
+test('resolveEffectivePlanStatus: free/promotional users correctly display 0 paid and acquisition source without infinite ratio', () => {
+  const live = {
+    status: 'identified',
+    tierKey: 'pro',
+    tierName: 'Google AI Pro',
+    email: 'student@example.com',
+    region: '未知',
+    actualPricePaid: null,
+    officialPriceMonthly: 19.99
+  };
+
+  const custom = {
+    email: 'student@example.com',
+    acquisitionSource: 'student_offer',
+    isZeroExtraCost: true,
+    actualPricePaid: 0,
+    currency: 'CNY',
+    validEndDate: '2027-01-01',
+    customNote: '2026 学生优惠'
+  };
+
+  const effective = resolveEffectivePlanStatus(live, custom);
+  assert.equal(effective.actualPricePaid, 0);
+  assert.equal(effective.isZeroExtraCost, true);
+  assert.equal(effective.currency, 'CNY');
+  assert.equal(effective.currencySymbol, '¥');
+  assert.equal(effective.acquisitionSource, 'student_offer');
+  assert.match(effective.acquisitionSourceName, /学生认证优惠/);
+  assert.match(effective.priceRangeNote, /¥0/);
+  assert.equal(effective.isExpired, false);
+
+  // 测试已到期状态
+  const expiredCustom = {
+    ...custom,
+    validEndDate: '2025-01-01' // 历史已到期
+  };
+  const effExpired = resolveEffectivePlanStatus(live, expiredCustom);
+  assert.equal(effExpired.isExpired, true);
+  assert.match(effExpired.priceRangeNote, /权益已到期/);
+});
+
+
+test('subscription regions preset and CNY currency conversion match market rates', () => {
+  assert.ok(SUBSCRIPTION_REGIONS_PRESET.length >= 15);
+
+  // 地区查询与别名识别
+  const us = findRegionPreset('美国');
+  assert.equal(us.id, 'US');
+  assert.equal(us.currency, 'USD');
+  assert.equal(us.monthlyPrice, 19.99);
+
+  const tr = findRegionPreset('土耳其');
+  assert.equal(tr.id, 'TR');
+  assert.equal(tr.currency, 'TRY');
+
+  const hk = findRegionPreset('港区');
+  assert.equal(hk.id, 'HK');
+  assert.equal(hk.currency, 'HKD');
+
+  const jp = findRegionPreset('日本');
+  assert.equal(jp.id, 'JP');
+  assert.equal(jp.currency, 'JPY');
+
+  const ng = findRegionPreset('尼日利亚');
+  assert.equal(ng.id, 'NG');
+  assert.equal(ng.currency, 'NGN');
+
+  // 汇率换算折合人民币核验
+  // 19.99 USD * 6.72 = 134.33
+  const cnyUS = convertToCNY(19.99, 'USD', '美国');
+  assert.equal(cnyUS, 134.33);
+
+  // 2900 JPY * 0.0425 = 123.25
+  const cnyJP = convertToCNY(2900, 'JPY', '日本');
+  assert.equal(cnyJP, 123.25);
+
+  // 158 HKD * 0.857 = 135.41
+  const cnyHK = convertToCNY(158, 'HKD', '中国香港');
+  assert.equal(cnyHK, 135.41);
+
+  // 869.99 TRY * 0.133 = 115.71
+  const cnyTR = convertToCNY(869.99, 'TRY', '土耳其');
+  assert.equal(cnyTR, 115.71);
+
+  // 28500 NGN * 0.0042 = 119.70
+  const cnyNG = convertToCNY(28500, 'NGN', '尼日利亚');
+  assert.equal(cnyNG, 119.7);
+});
+
+test('resolveEffectivePlanStatus: calculates CNY price and displays bracketed conversion', () => {
+  const live = {
+    status: 'identified',
+    tierKey: 'pro',
+    tierName: 'Google AI Pro',
+    email: 'user@example.com',
+    region: '未知',
+    actualPricePaid: null
+  };
+
+  const custom = {
+    email: 'user@example.com',
+    region: '日本 (JP)',
+    actualPricePaid: 2900,
+    currency: 'JPY',
+    billingCycle: '月付'
+  };
+
+  const effective = resolveEffectivePlanStatus(live, custom);
+  assert.equal(effective.region, '日本 (JP)');
+  assert.equal(effective.actualPricePaid, 2900);
+  assert.equal(effective.currency, 'JPY');
+  assert.equal(effective.currencySymbol, '¥');
+  assert.equal(effective.actualPricePaidCNY, 123.25);
+  assert.equal(effective.cnyFormatted, '折合 ≈ ¥123.3 CNY');
+  assert.match(effective.priceRangeNote, /¥2900/);
+  assert.match(effective.priceRangeNote, /折合 ≈ ¥123.3/);
+});
+
+test('plugin settings persistence: distinct country, subscriptionRegion, currency, legacy migration, corruption recovery, and failure feedback', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const {
+    loadCustomPlanSettings,
+    savePluginSettings,
+    getPluginSettings
+  } = require('./meter-collector');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-settings-test-'));
+  try {
+    // 1. 保存三项独立设置：国家 (美国)、订阅地区 (韩国)、币种 (KRW)
+    const saveRes = savePluginSettings({
+      email: 'user@example.com',
+      customPlan: {
+        country: '美国 (US)',
+        subscriptionRegion: '韩国 (KRW)',
+        currency: 'KRW',
+        actualPricePaid: 29000,
+        billingCycle: '月付'
+      }
+    }, { agDir: tmpDir });
+
+    assert.equal(saveRes.ok, true);
+    assert.equal(saveRes.planStatus.country, '美国 (US)');
+    assert.equal(saveRes.planStatus.subscriptionRegion, '韩国 (KRW)');
+    assert.equal(saveRes.planStatus.region, '韩国 (KRW)');
+    assert.equal(saveRes.planStatus.currency, 'KRW');
+    assert.equal(saveRes.planStatus.currencySymbol, '₩');
+
+    // 2. 重启后读取（含未识别邮箱时通过 default / lastAccount 恢复）
+    const loadedNoEmail = getPluginSettings({ agDir: tmpDir });
+    assert.equal(loadedNoEmail.ok, true);
+    assert.equal(loadedNoEmail.customPlan.country, '美国 (US)');
+    assert.equal(loadedNoEmail.customPlan.subscriptionRegion, '韩国 (KRW)');
+    assert.equal(loadedNoEmail.customPlan.currency, 'KRW');
+
+    // 3. 单独修改币种为 AUD，验证国家与订阅地区不被覆盖
+    const saveCurOnly = savePluginSettings({
+      email: 'user@example.com',
+      customPlan: {
+        currency: 'AUD',
+        actualPricePaid: 32.99
+      }
+    }, { agDir: tmpDir });
+    assert.equal(saveCurOnly.ok, true);
+    assert.equal(saveCurOnly.planStatus.country, '美国 (US)');
+    assert.equal(saveCurOnly.planStatus.subscriptionRegion, '韩国 (KRW)');
+    assert.equal(saveCurOnly.planStatus.currency, 'AUD');
+    assert.equal(saveCurOnly.planStatus.currencySymbol, 'AU$');
+
+    // 4. 兼容旧配置（仅含 region、含无效币种与非法价格）
+    const cfgFile = path.join(tmpDir, 'custom_plan_v1.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      version: '1.0.0',
+      accounts: {
+        default: {
+          region: '澳大利亚 (AUD)',
+          currency: 'INVALID_CURRENCY_CODE',
+          actualPricePaid: 'not-a-number'
+        }
+      }
+    }), 'utf8');
+    const legacyLoaded = getPluginSettings({ agDir: tmpDir });
+    assert.equal(legacyLoaded.customPlan.region, '澳大利亚 (AUD)');
+    assert.equal(legacyLoaded.customPlan.subscriptionRegion, '澳大利亚 (AUD)');
+    assert.equal(legacyLoaded.customPlan.currency, undefined);
+    const resolvedLegacy = resolveEffectivePlanStatus(null, legacyLoaded.customPlan);
+    assert.equal(resolvedLegacy.currency, 'AUD');
+    assert.equal(resolvedLegacy.actualPricePaid, 32.99);
+
+    // 5. 配置文件损坏时自动隔离备份并恢复默认结构
+    fs.writeFileSync(cfgFile, '{corrupted json content!!!', 'utf8');
+    const corruptLoaded = loadCustomPlanSettings(tmpDir);
+    assert.equal(corruptLoaded.recoveredFromCorruption, true);
+    assert.ok(fs.existsSync(path.join(tmpDir, 'custom_plan_v1.corrupt.bak.json')));
+
+    // 6. 保存失败时返回真实错误反馈（将目标文件位置建为目录以触发写入失败）
+    const badDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-settings-fail-'));
+    fs.mkdirSync(path.join(badDir, 'custom_plan_v1.json'), { recursive: true });
+    const failRes = savePluginSettings({
+      customPlan: { country: '日本 (JP)', subscriptionRegion: '日本 (JP)', currency: 'JPY' }
+    }, { agDir: badDir });
+    assert.equal(failRes.ok, false);
+    assert.match(failRes.error, /目录|失败/);
+    fs.rmSync(badDir, { recursive: true, force: true });
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('CLI resolution & workspace handling: Chinese/space paths, fallback directory, and missing CLI error feedback', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { pathToFileURL } = require('node:url');
+  const {
+    resolveCliExecutable,
+    resolveCliWorkspace,
+    launchCliSession
+  } = require('./meter-collector');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-cli-test-'));
+  try {
+    // 1. 创建含中文与空格的项目目录及模拟 CLI 文件
+    const cnSpaceDir = path.join(tmpRoot, '测试 项目 (中文 Space Dir)');
+    fs.mkdirSync(cnSpaceDir, { recursive: true });
+    const fakeCli = path.join(tmpRoot, 'agy.exe');
+    fs.writeFileSync(fakeCli, 'fake-binary', 'utf8');
+
+    // 2. 验证显式传入及 file:// URI 编码的中文空格路径解析
+    const encodedUri = pathToFileURL(cnSpaceDir).href;
+    const wsFromUri = await resolveCliWorkspace({ cwd: encodedUri });
+    assert.equal(wsFromUri.ok, true);
+    assert.equal(wsFromUri.cwd, cnSpaceDir);
+
+    // 3. 验证 dryRun 启动命令组装与参数传递
+    const dryRes = await launchCliSession({
+      cliPath: fakeCli,
+      cwd: cnSpaceDir,
+      model: 'gemini-3.8-flash-high',
+      args: ['--continue'],
+      dryRun: true
+    });
+    assert.equal(dryRes.ok, true);
+    assert.equal(dryRes.exePath, fakeCli);
+    assert.equal(dryRes.cwd, cnSpaceDir);
+    assert.deepEqual(dryRes.args, ['--model', 'gemini-3.8-flash-high', '--continue']);
+
+    // 4. 验证 CLI 不存在时的明确报错反馈
+    const missingCliPath = path.join(tmpRoot, 'nonexistent-dir', 'missing-agy.exe');
+    const missingRes = await launchCliSession({
+      cliPath: missingCliPath,
+      cwd: cnSpaceDir
+    });
+    assert.equal(missingRes.ok, false);
+    assert.equal(missingRes.code, 'CLI_NOT_FOUND');
+    assert.match(missingRes.error, /不存在|不可用/);
+
+    // 5. 验证未打开项目时的默认目录回退
+    const fallbackWs = await resolveCliWorkspace({
+      cascadeId: '00000000-0000-0000-0000-000000000000',
+      agDir: tmpRoot,
+      appDataDir: tmpRoot,
+      configDir: tmpRoot,
+      defaultDir: cnSpaceDir
+    });
+    assert.equal(fallbackWs.ok, true);
+    assert.equal(fallbackWs.cwd, cnSpaceDir);
+    assert.equal(fallbackWs.source, 'default_fallback');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// 错误分类与状态识别行为测试
+// ============================================================================
+test('server explicit quota error classifies as quota_exhausted with affected model info', () => {
+  const d = entry({ inputTokens: 5000 });
+  d.chatModel.modelDisplayName = 'Gemini 4 Argon (High)';
+  d.chatModel.retryInfos = [
+    { error: 'rpc error: code = ResourceExhausted desc = Quota exceeded for quota metric Gemini4ArgonPerWeek', usage: { model: 'gemini' } }
+  ];
+  const s = summarize(d, { currentModel: 'Gemini 4 Argon (High)' });
+  assert.equal(s.exceeded, false);
+  assert.equal(s.network, false);
+  assert.equal(s.status, 'quota_exhausted');
+  assert.equal(s.errorClassification.kind, 'quota_exhausted');
+  assert.equal(s.errorClassification.badgeText, '额度耗尽');
+  assert.match(s.errorClassification.detail, /额度已用尽/);
+});
+
+test('exhausted model quota does not leak into isolated model pools with remaining quota', () => {
+  const cascadeConfigs = [
+    { modelId: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)', quotaInfo: { remainingFraction: 0, resetTime: '2026-11-15T14:29:07Z' } },
+    { modelId: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)', quotaInfo: { remainingFraction: 0.99, resetTime: '2026-11-09T15:22:10Z' } }
+  ];
+
+  // 1. Argon 请求：配额确凿为 0，发生非取消错误时判定为额度耗尽
+  const argonEntry = entry({ inputTokens: 10000 });
+  argonEntry.chatModel.modelDisplayName = 'Gemini 4 Argon (High)';
+  argonEntry.chatModel.retryInfos = [{ error: 'request failed: ResourceExhausted', usage: { model: 'gemini-4-argon-high' } }];
+  const sArgon = summarize(argonEntry, { currentModel: 'Gemini 4 Argon (High)', cascadeModelConfigs: cascadeConfigs });
+  assert.equal(sArgon.status, 'quota_exhausted');
+  assert.equal(sArgon.errorClassification.kind, 'quota_exhausted');
+  assert.match(sArgon.errorClassification.detail, /Gemini 4 Argon.*额度已用尽/);
+
+  // 2. Flash 请求：配额剩余 99%，即使遇到通用报错，绝不能被 Argon 的耗尽影响
+  const flashEntry = entry({ inputTokens: 10000 });
+  flashEntry.chatModel.modelDisplayName = 'Gemini 3.8 Flash (High)';
+  flashEntry.chatModel.retryInfos = [{ error: 'request failed: internal error', usage: { model: 'gemini-3.8-flash-high' } }];
+  const sFlash = summarize(flashEntry, { currentModel: 'Gemini 3.8 Flash (High)', cascadeModelConfigs: cascadeConfigs });
+  assert.notEqual(sFlash.status, 'quota_exhausted');
+  assert.notEqual(sFlash.errorClassification.kind, 'quota_exhausted');
+});
+
+test('network errors are not misclassified as quota exhaustion even when remaining quota is low', () => {
+  const cascadeConfigs = [
+    { modelId: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)', quotaInfo: { remainingFraction: 0.0104, resetTime: '2026-11-15T14:29:07Z' } }
+  ];
+  const d = entry({ inputTokens: 538000, maxContextTokens: 983040 });
+  d.chatModel.modelDisplayName = 'Gemini 4 Argon (High)';
+  d.chatModel.retryInfos = [
+    { error: 'request failed: stream idle timeout (5m0s): context deadline exceeded', usage: { model: 'gemini' } }
+  ];
+  const s = summarize(d, {
+    currentModel: 'Gemini 4 Argon (High)',
+    cascadeModelConfigs: cascadeConfigs,
+    previousValidContext: { used: 538000, actual: 538000, budget: 983040 }
+  });
+
+  // 必须严格判定为网络错误，绝不编造成额度耗尽！
+  assert.equal(s.exceeded, false);
+  assert.equal(s.network, true);
+  assert.equal(s.status, 'network');
+  assert.equal(s.errorClassification.kind, 'network_error');
+  assert.equal(s.errorClassification.badgeText, '网络');
+  assert.match(s.errorClassification.detail, /超时|网络/);
+
+  // 上下文容量与错误状态解耦：有效用量与预算得到保留，绝不置为 null 或 0
+  assert.equal(s.budget, 983040);
+  assert.equal(s.used, 538000);
+});
+
+test('rate limits with retry-after are distinguished from long-term quota exhaustion', () => {
+  // A: 触发请求频率限制（含 retry-after 25s）
+  const rateLimitEntry = entry({ inputTokens: 2000 });
+  rateLimitEntry.chatModel.retryInfos = [{ error: 'HTTP 429 Too Many Requests: Rate limit exceeded, retry in 25s', usage: { model: 'gemini' } }];
+  const sRate = summarize(rateLimitEntry, { currentModel: 'Gemini 3.8 Flash' });
+  assert.equal(sRate.status, 'rate_limited');
+  assert.equal(sRate.errorClassification.kind, 'rate_limited');
+  assert.equal(sRate.errorClassification.badgeText, '限流');
+  assert.equal(sRate.errorClassification.retryAfterSec, 25);
+  assert.match(sRate.errorClassification.detail, /25/);
+
+  // B: 长期配额耗尽
+  const quotaEntry = entry({ inputTokens: 2000 });
+  quotaEntry.chatModel.retryInfos = [{ error: 'HTTP 429 ResourceExhausted: You have exhausted your current quota for the month', usage: { model: 'gemini' } }];
+  const sQuota = summarize(quotaEntry, { currentModel: 'Gemini 3.8 Flash' });
+  assert.equal(sQuota.status, 'quota_exhausted');
+  assert.equal(sQuota.errorClassification.kind, 'quota_exhausted');
+  assert.equal(sQuota.errorClassification.badgeText, '额度耗尽');
+});
+
+test('context length overflow extracts service limit and flags overflow alert', () => {
+  const d = entry({ inputTokens: 10000 });
+  d.chatModel.retryInfos = [
+    { error: 'input token count exceeds maximum context length of 1048576 tokens', usage: { model: 'gemini' } }
+  ];
+  const s = summarize(d, { currentModel: 'Gemini 4 Argon' });
+  assert.equal(s.exceeded, true);
+  assert.equal(s.network, false);
+  assert.equal(s.serviceLimit, 1048576);
+  assert.equal(s.status, 'exceeded');
+  assert.equal(s.errorClassification.kind, 'context_overflow');
+  assert.equal(s.errorClassification.badgeText, '超限');
+  assert.match(s.errorClassification.detail, /1048576/);
+});
+
+test('explicit quota error dominates subsequent connection timeout during retries', () => {
+  const d = entry({ inputTokens: 8000 });
+  d.chatModel.modelDisplayName = 'Gemini 4 Argon';
+  d.chatModel.retryInfos = [
+    { error: 'rpc error: code = ResourceExhausted desc = weekly quota exceeded', usage: { model: 'gemini' } },
+    { error: 'request failed: context deadline exceeded', usage: { model: 'gemini' } }
+  ];
+  const s = summarize(d, { currentModel: 'Gemini 4 Argon' });
+  assert.equal(s.network, true);
+  const combinedClass = classifyRequestError(
+    d.chatModel.retryInfos.map(r => r.error).join(' | '),
+    { currentModel: 'Gemini 4 Argon' }
+  );
+  assert.equal(combinedClass.kind, 'quota_exhausted');
+  assert.equal(combinedClass.badgeText, '额度耗尽');
+});
+
+test('unrecognized server errors are marked unknown with sanitized diagnostic info', () => {
+  const d = entry({ inputTokens: 4000 });
+  d.chatModel.retryInfos = [
+    { error: 'Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent": unexpected status 500: unknown internal error id 98124', usage: { model: 'gemini' } }
+  ];
+  const s = summarize(d, { currentModel: 'Gemini 4 Argon' });
+  assert.equal(s.exceeded, false);
+  assert.equal(s.network, false);
+  assert.equal(s.errorClassification.kind, 'unknown');
+  assert.equal(s.errorClassification.badgeText, '待确认');
+  assert.equal(s.errorClassification.title, '原因待确认');
+  assert.match(s.errorClassification.diagnostic, /<API>/);
+  assert.doesNotMatch(s.errorClassification.diagnostic, /https:\/\/daily-cloudcode-pa/);
+});
+
+test('plain Go cancellations are recognized without attributing them to the user', () => {
+  const messages = [
+    'stream reading error: context canceled',
+    'request failed: Post "https://example.invalid/private-api": context canceled',
+    'rpc error: code = Canceled desc = context cancelled',
+    'context canceled by user',
+    'user cancelled',
+    'request was aborted',
+    'AbortError'
+  ];
+  const previous = summarize(entry({ inputTokens: 12000, outputTokens: 200 }, { maxContextTokens: 512000 }));
+  for (const error of messages) {
+    const d = entry({}, { maxContextTokens: 512000 });
+    d.chatModel.retryInfos = [{ error }];
+    const result = summarize(d, { previousValidContext: previous });
+    assert.equal(result.status, 'canceled', error);
+    assert.equal(result.errorClassification.kind, 'canceled', error);
+    assert.equal(result.errorClassification.badgeText, '已中断');
+    assert.doesNotMatch(result.errorClassification.detail, /已由用户|用户主动|用户取消/);
+    assert.doesNotMatch(result.errorClassification.diagnostic, /https:\/\/example/);
+    assert.equal(result.actual, previous.actual);
+    assert.equal(result.budget, previous.budget);
+    assert.equal(result.exceeded, false);
+    assert.equal(result.network, false);
+  }
+  assert.equal(classifyRequestError('context deadline exceeded').kind, 'network_error');
+  assert.equal(classifyRequestError('unexpected internal error').kind, 'unknown');
+});
+
+test('cancelled requests are not relabeled exhausted from quota snapshot alone', () => {
+  const options = {
+    currentModel: 'gemini-4-argon-high',
+    cascadeModelConfigs: [{
+      modelId: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)',
+      quotaInfo: { remainingFraction: 0 }
+    }]
+  };
+  assert.equal(classifyRequestError('request failed: context canceled', options).kind, 'canceled');
+  assert.equal(classifyRequestError('weekly quota exceeded; context canceled', options).kind, 'quota_exhausted');
+  assert.equal(classifyRequestError(exceeded + '; context canceled', options).kind, 'context_overflow');
+});
+
+test('getLvlForRange: accurate thresholds for day, week and month ranges', () => {
+  // 1. day: 绝对阈值 (0, <3M, <15M, <60M, >=60M)
+  assert.equal(getLvlForRange(0, 'day'), 0);
+  assert.equal(getLvlForRange(1000, 'day'), 1);
+  assert.equal(getLvlForRange(2999999, 'day'), 1);
+  assert.equal(getLvlForRange(3000000, 'day'), 2);
+  assert.equal(getLvlForRange(14999999, 'day'), 2);
+  assert.equal(getLvlForRange(15000000, 'day'), 3);
+  assert.equal(getLvlForRange(59999999, 'day'), 3);
+  assert.equal(getLvlForRange(60000000, 'day'), 4);
+  assert.equal(getLvlForRange(1e9, 'day'), 4);
+
+  // 2. week / month: 相对最大值分位 (0, <=25%, <=50%, <=75%, >75%)
+  const maxVal = 100000;
+  assert.equal(getLvlForRange(0, 'week', maxVal), 0);
+  assert.equal(getLvlForRange(10000, 'week', maxVal), 1);
+  assert.equal(getLvlForRange(25000, 'week', maxVal), 1);
+  assert.equal(getLvlForRange(25001, 'week', maxVal), 2);
+  assert.equal(getLvlForRange(50000, 'week', maxVal), 2);
+  assert.equal(getLvlForRange(50001, 'week', maxVal), 3);
+  assert.equal(getLvlForRange(75000, 'week', maxVal), 3);
+  assert.equal(getLvlForRange(75001, 'week', maxVal), 4);
+  assert.equal(getLvlForRange(100000, 'week', maxVal), 4);
+
+  assert.equal(getLvlForRange(0, 'month', 200), 0);
+  assert.equal(getLvlForRange(50, 'month', 200), 1);
+  assert.equal(getLvlForRange(100, 'month', 200), 2);
+  assert.equal(getLvlForRange(150, 'month', 200), 3);
+  assert.equal(getLvlForRange(200, 'month', 200), 4);
+});
+
+test('calculateIntervalCost: day->week->month->year->cum sum equivalence (< 1e-9) and future exclusion', () => {
+  // 固定测试样本数据
+  const dailyMap = {
+    '2026-11-01': { input: 100000, cache: 20000, output: 10000, total: 130000 },
+    '2026-11-02': { input: 200000, cache: 50000, output: 30000, total: 280000 },
+    '2026-11-03': { input: 150000, cache: 10000, output: 20000, total: 180000 },
+    '2026-11-04': { input: 0, cache: 0, output: 0, total: 0 },
+    '2026-11-05': { input: 300000, cache: 80000, output: 50000, total: 430000 },
+    '2026-11-06': { input: 50000, cache: 0, output: 5000, total: 55000 },
+    '2026-11-07': { input: 120000, cache: 30000, output: 15000, total: 165000 },
+    // 假设今日为 2026-11-07，以下为未来日期
+    '2026-11-08': { input: 0, cache: 0, output: 0, total: 0 },
+    '2026-11-09': { input: 0, cache: 0, output: 0, total: 0 }
+  };
+
+  const datesWeek1 = ['2026-11-01', '2026-11-02', '2026-11-03'];
+  const datesWeek2 = ['2026-11-04', '2026-11-05', '2026-11-06', '2026-11-07'];
+  const allDates = [...datesWeek1, ...datesWeek2, '2026-11-08', '2026-11-09'];
+
+  const options = { pricingDate: '2026-11-08', todayStr: '2026-11-07' };
+  const costW1 = calculateIntervalCost(dailyMap, datesWeek1, 'gemini-3.8-flash', options);
+  const costW2 = calculateIntervalCost(dailyMap, datesWeek2, 'gemini-3.8-flash', options);
+  const costAll = calculateIntervalCost(dailyMap, allDates, 'gemini-3.8-flash', options);
+
+  // 1. 逐级求和一致性（周1费用 + 周2费用 == 全月费用，误差 < 1e-9）
+  const sumWeeks = costW1.totalCostUSD + costW2.totalCostUSD;
+  assert.ok(Math.abs(sumWeeks - costAll.totalCostUSD) < 1e-9, `sumWeeks (${sumWeeks}) should equal costAll (${costAll.totalCostUSD})`);
+
+  // 2. 独立按单日计算之和校验
+  let independentSum = 0;
+  for (const d of ['2026-11-01', '2026-11-02', '2026-11-03', '2026-11-05', '2026-11-06', '2026-11-07']) {
+    const single = getDailyModelCost(dailyMap[d], d, 'gemini-3.8-flash', options);
+    independentSum += single.costUSD;
+  }
+  assert.ok(Math.abs(independentSum - costAll.totalCostUSD) < 1e-9);
+
+  // 3. 未来日期排除：参与天数一共 9 天，但 08 和 09 是未来，pastDays 应为 7
+  assert.equal(costAll.pastDays, 7);
+  assert.equal(costAll.activeDays, 6); // 11-04 为 0 token，活跃天数是 6
+  assert.equal(costAll.dailyAverageUSD, Number((costAll.totalCostUSD / 7).toFixed(4)));
+  assert.equal(costAll.activeDailyAverageUSD, Number((costAll.totalCostUSD / 6).toFixed(4)));
+});
+
+test('semver & update filtering: strictly accepts v0.x tags, ignores asset filename versioning, and validates platforms', () => {
+  assert.deepEqual(parseSemver('v0.8.0'), { major: 0, minor: 8, patch: 0 });
+  assert.deepEqual(parseSemver('0.7.2'), { major: 0, minor: 7, patch: 2 });
+  // 防御性过滤：主版本非 0 一律忽略
+  assert.equal(parseSemver('v2.7.4'), null);
+  assert.equal(parseSemver('v1.0.0'), null);
+  assert.equal(parseSemver('beta-0.8.0'), null);
+
+  assert.equal(compareVersions('0.8.1', '0.8.0'), 1);
+  assert.equal(compareVersions('0.8.0', '0.8.0'), 0);
+  assert.equal(compareVersions('0.7.0', '0.8.0'), -1);
+  assert.equal(compareVersions('0.8.8', '0.8.8'), 0);
+  assert.equal(compareVersions('0.8.9', '0.8.8'), 1);
+
+  // 预发布版本比较规则：0.8.8 < 0.8.9-beta.1 < 0.8.9-beta.2 < 0.8.9
+  assert.deepEqual(parseSemver('v0.8.9-beta.1'), { major: 0, minor: 8, patch: 9, prerelease: 'beta.1' });
+  assert.equal(compareVersions('0.8.8', '0.8.9-beta.1'), -1);
+  assert.equal(compareVersions('0.8.9-beta.1', '0.8.9-beta.2'), -1);
+  assert.equal(compareVersions('0.8.9-beta.2', '0.8.9'), -1);
+  assert.equal(compareVersions('0.8.9', '0.8.9-beta.2'), 1);
+  assert.equal(compareVersions('0.8.9-beta.1', '0.8.9-beta.1'), 0);
+  assert.equal(compareVersions('0.8.9-beta.10', '0.8.9-beta.2'), 1);
+
+  // Release 通道隔离与 beta 升级到正式版
+  const preReleases = [
+    { tag_name: 'v0.8.9-beta.1', draft: false, prerelease: true, html_url: 'https://github.com/.../v0.8.9-beta.1', assets: [] },
+    { tag_name: 'v0.8.9-beta.2', draft: false, prerelease: true, html_url: 'https://github.com/.../v0.8.9-beta.2', assets: [] }
+  ];
+  // 正式版用户默认不推送 beta
+  assert.equal(filterReleases(preReleases, '0.8.8').length, 0);
+  assert.equal(filterReleases(preReleases, '0.8.8', { allowBetaUpdates: false }).length, 0);
+  // 正式版用户开启 beta 开关时可收到 beta.2
+  const optInForStable = filterReleases(preReleases, '0.8.8', { allowBetaUpdates: true });
+  assert.equal(optInForStable.length, 2);
+  assert.equal(optInForStable[0].version, '0.8.9-beta.2');
+  // beta.1 用户可升级到 beta.2 与正式版 0.8.9（且 0.8.9 排在最前）
+  const withStable = [
+    ...preReleases,
+    { tag_name: 'v0.8.9', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.8.9', assets: [] }
+  ];
+  const forBetaUser = filterReleases(withStable, '0.8.9-beta.1');
+  assert.equal(forBetaUser.length, 2);
+  assert.equal(forBetaUser[0].version, '0.8.9');
+  assert.equal(forBetaUser[0].prerelease, false);
+  assert.equal(forBetaUser[1].version, '0.8.9-beta.2');
+  assert.equal(forBetaUser[1].prerelease, true);
+
+  // Release 过滤测试：包含历史 Release（ZIP 中仍可能带有 2.7.x 文件名）
+  const mockReleases = [
+    { tag_name: 'v2.7.4', draft: false, prerelease: false }, // 应忽略
+    { tag_name: 'v0.9.0', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.9.0', assets: [] },
+    { tag_name: 'v0.8.1', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.8.1', assets: [] },
+    { tag_name: 'v0.8.0', draft: false, prerelease: false }, // 不大于当前版本
+    { tag_name: 'v0.10.0-draft', draft: true, prerelease: false } // draft 忽略
+  ];
+
+  const valid = filterReleases(mockReleases, '0.8.0');
+  assert.equal(valid.length, 2);
+  assert.equal(valid[0].version, '0.9.0');
+  assert.equal(valid[1].version, '0.8.1');
+
+  // 0.8.8 比较：同版本 v0.8.8 (title: 'v0.8.8 α') 判无更新；存在 v0.8.9 判有更新
+  assert.equal(filterReleases([
+    { tag_name: 'v0.8.8', name: 'v0.8.8 α', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.8.8', assets: [] }
+  ], '0.8.8').length, 0);
+  const valid089 = filterReleases([
+    { tag_name: 'v0.8.8', name: 'v0.8.8 α', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.8.8', assets: [] },
+    { tag_name: 'v0.8.9', name: 'v0.8.9', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.8.9', assets: [] }
+  ], '0.8.8');
+  assert.equal(valid089.length, 1);
+  assert.equal(valid089[0].version, '0.8.9');
+
+  // 资产匹配测试（即使历史文件名带 2.7.x 也能基于 platform/arch 正确解析）
+  const mockAssets = [
+    { name: 'antigravity-context-viewer_2.7.2_windows_amd64.zip', browser_download_url: 'https://.../win.zip' },
+    { name: 'antigravity-context-viewer_2.7.2_darwin_arm64.zip', browser_download_url: 'https://.../mac.zip' },
+    { name: 'checksums.txt', browser_download_url: 'https://.../checksums.txt' }
+  ];
+
+  const winMatch = findReleaseAsset(mockAssets, 'win32', 'x64');
+  assert.equal(winMatch.packageAsset.name, 'antigravity-context-viewer_2.7.2_windows_amd64.zip');
+  assert.equal(winMatch.checksumAsset.name, 'checksums.txt');
+
+  const macMatch = findReleaseAsset(mockAssets, 'darwin', 'arm64');
+  assert.equal(macMatch.packageAsset.name, 'antigravity-context-viewer_2.7.2_darwin_arm64.zip');
+
+  const missingMatch = findReleaseAsset(mockAssets, 'linux', 'arm64');
+  assert.equal(missingMatch.packageAsset, null);
+  assert.equal(missingMatch.checksumAsset.name, 'checksums.txt');
+});
+
+test('isValidExternalUrl: strictly allows only official repository paths and subpaths', () => {
+  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer'), true);
+  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/'), true);
+  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases'), true);
+  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/issues'), true);
+  assert.equal(isValidExternalUrl('https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/tag/v0.8.0'), true);
+
+  // 拒绝非官方仓库与恶意跳转
+  assert.equal(isValidExternalUrl('https://github.com/other-user/antigravity-context-viewer'), false);
+  assert.equal(isValidExternalUrl('https://malicious.com/github.com/elviscjn-cjn/antigravity-context-viewer'), false);
+  assert.equal(isValidExternalUrl('http://github.com/elviscjn-cjn/antigravity-context-viewer'), false); // 非 https
+  assert.equal(isValidExternalUrl('javascript:alert(1)'), false);
+  assert.equal(isValidExternalUrl(''), false);
+  assert.equal(isValidExternalUrl(null), false);
+});
+
+test('collectTokenHistoryAsync 连续两次非强制调用不会卡在旧 activeScanPromise 并能在入账后获取最新数据', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-meter-deadlock-test-'));
+  const tempCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-meter-deadlock-cli-'));
+  const prevAgDir = process.env.AG_DIR;
+  const prevAgCliDir = process.env.AG_CLI_DIR;
+  process.env.AG_DIR = tempDir;
+  process.env.AG_CLI_DIR = tempCliDir;
+
+  try {
+    fs.mkdirSync(path.join(tempDir, 'brain', 'session_1'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'conversations'), { recursive: true });
+    fs.mkdirSync(path.join(tempCliDir, 'brain'), { recursive: true });
+    fs.mkdirSync(path.join(tempCliDir, 'conversations'), { recursive: true });
+
+    // 写入第一个对话数据（5500 tokens）
+    const event1 = {
+      created_at: '2026-11-08T10:00:00Z',
+      model: 'gemini-3.8-flash',
+      chatModel: { usage: { inputTokens: 5000, outputTokens: 500, cacheReadTokens: 0 } }
+    };
+    fs.writeFileSync(path.join(tempDir, 'brain', 'session_1', 'transcript.jsonl'), JSON.stringify(event1) + '\n', 'utf8');
+
+    // 1. 发起第一次调用（非强制，初始化全局缓存与 activeScanPromise）
+    const res1 = await collectTokenHistoryAsync({ force: false });
+    assert.ok(res1);
+    assert.equal(res1.summary.grandTotalTokens, 5500);
+
+    // 2. 写入第二个对话数据（新增 2300 tokens）
+    fs.mkdirSync(path.join(tempDir, 'brain', 'session_2'), { recursive: true });
+    const event2 = {
+      created_at: '2026-11-08T11:00:00Z',
+      model: 'gemini-3.8-flash',
+      chatModel: { usage: { inputTokens: 2000, outputTokens: 300, cacheReadTokens: 0 } }
+    };
+    fs.writeFileSync(path.join(tempDir, 'brain', 'session_2', 'transcript.jsonl'), JSON.stringify(event2) + '\n', 'utf8');
+
+    // recordModelCalls 入账成功并重置 cachedTokenHistoryAt = 0 使缓存失效
+    const recRes = recordModelCalls([{
+      callId: 'call_regress_deadlock_1',
+      model: 'gemini-3.8-flash',
+      status: 'final',
+      inputTokens: 2000,
+      outputTokens: 300,
+      created_at: new Date().toISOString()
+    }]);
+    assert.equal(recRes.ok, true);
+    assert.equal(recRes.changed, true);
+
+    // 3. 发起第二次非强制调用（force: false）
+    // 旧代码由于 runner.finally 比较错误，activeScanPromise 永远不为空，后续所有 force: false 调用恒返回旧的首次结果 (5500)
+    // 修复后 activeScanPromise 在首次完成后已成功释放，缓存已失效，此处必须执行新扫描并返回 7800 tokens
+    const res2 = await collectTokenHistoryAsync({ force: false });
+    assert.ok(res2);
+    assert.equal(res2.summary.grandTotalTokens, 7800);
+
+    // 4. 验证顶层 savedHeatView 与 autoCheckUpdate 的持久化与读取一致性
+    const { savePluginSettings, getPluginSettings } = require('./meter-collector');
+    const saveUiRes = savePluginSettings({ savedHeatView: 'monthly', autoCheckUpdate: false }, { agDir: tempDir });
+    assert.equal(saveUiRes.ok, true);
+    const loadedUi = getPluginSettings({ agDir: tempDir });
+    assert.equal(loadedUi.ok, true);
+    assert.equal(loadedUi.savedHeatView, 'monthly');
+    assert.equal(loadedUi.autoCheckUpdate, false);
+    assert.equal(loadedUi.uiPreferences.savedHeatView, 'monthly');
+    assert.equal(loadedUi.uiPreferences.autoCheckUpdate, false);
+
+    // 5. 验证 getDailyModelCost 分项费用 (inputCost / cacheCost / outputCost) 正确返回非零数值
+    const { getDailyModelCost, clearDailyCostCache } = require('./meter-core');
+    clearDailyCostCache();
+    const dayCost = getDailyModelCost(
+      { total: 3000000, input: 1000000, cache: 1000000, output: 1000000 },
+      '2026-11-10',
+      'gemini-3.8-flash'
+    );
+    assert.ok(dayCost.inputCost > 0);
+    assert.ok(dayCost.cacheCost > 0);
+    assert.ok(dayCost.outputCost > 0);
+    assert.equal(dayCost.costUSD, Number((dayCost.inputCost + dayCost.cacheCost + dayCost.outputCost).toFixed(4)));
+  } finally {
+    if (prevAgDir !== undefined) process.env.AG_DIR = prevAgDir;
+    else delete process.env.AG_DIR;
+    if (prevAgCliDir !== undefined) process.env.AG_CLI_DIR = prevAgCliDir;
+    else delete process.env.AG_CLI_DIR;
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(tempCliDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('产品分组严守档位白名单、不破坏 Carbon/Argon 与代际，且不改变 normalizeModelId', () => {
+  const gLow = groupModelProduct({ modelId: 'gemini-4-hydrogen-low', label: 'Gemini 4 Hydrogen (Low)' });
+  const gHigh = groupModelProduct({ modelId: 'gemini-4-hydrogen-high', label: 'Gemini 4 Hydrogen (High)' });
+  assert.equal(gLow.productKey, gHigh.productKey);
+  assert.equal(gLow.productLabel, 'Gemini 4 Hydrogen');
+  assert.equal(gLow.effort, 'Low');
+  assert.equal(gHigh.effort, 'High');
+  assert.equal(gLow.vendor, 'Google');
+
+  const orchCarbon = groupModelProduct({ modelId: 'orchestrator-carbon', label: 'Orchestrator (Carbon)' });
+  const orchArgon = groupModelProduct({ modelId: 'orchestrator-argon', label: 'Orchestrator (Argon)' });
+  assert.notEqual(orchCarbon.productKey, orchArgon.productKey);
+  assert.equal(orchCarbon.productLabel, 'Orchestrator (Carbon)');
+  assert.equal(orchArgon.productLabel, 'Orchestrator (Argon)');
+  assert.equal(orchCarbon.effort, null);
+
+  const geminiArgon = groupModelProduct({ modelId: 'gemini-4-argon', label: 'Gemini 4 Argon' });
+  assert.notEqual(geminiArgon.productKey, orchArgon.productKey);
+
+  const g38Flash = groupModelProduct({ modelId: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' });
+  const g4Flash = groupModelProduct({ modelId: 'gemini-4-flash', label: 'Gemini 4 Flash' });
+  assert.notEqual(g38Flash.productKey, g4Flash.productKey);
+
+  assert.equal(formatEffortLabel('extra_high'), 'Extra High');
+  assert.equal(detectModelVendor('Claude Sonnet 4.6', 'claude-sonnet-4-6'), 'Anthropic');
+  assert.equal(detectModelVendor('GPT-5.4 Mini', 'gpt-5-4-mini'), 'OpenAI');
+
+  // 验证 normalizeModelId 计费归一化未被改动
+  assert.equal(normalizeModelId('gemini-3.8-flash-high'), 'gemini-3.8-flash');
+  assert.equal(normalizeModelId('gemini-4-argon-low'), 'gemini-4-argon');
+  assert.equal(normalizeModelId('gemini-3.1-pro-high'), 'gemini-3.1-pro-preview');
+});
+
+test('formatTokensK 与速度统计纯函数：中位数、样本数、无效样本排除与 200 条上限', () => {
+  assert.equal(formatTokensK(512000), '512K');
+  assert.equal(formatTokensK(256000), '256K');
+  assert.equal(formatTokensK(786432), '786.4K');
+  assert.equal(formatTokensK(1048576), '1.05M');
+  assert.equal(formatTokensK(null), '—');
+
+  assert.equal(computeMedian([10, 50, 20]), 20);
+  assert.equal(computeMedian([10, 20, 30, 40]), 25);
+  assert.equal(computeMedian([]), null);
+
+  assert.equal(isValidSpeedSample({ status: 'final', outputTokens: 100, durationSec: 2 }), true);
+  assert.equal(isValidSpeedSample({ status: 'streaming', outputTokens: 100, durationSec: 2 }), false);
+  assert.equal(isValidSpeedSample({ status: 'final', isEstimated: true, outputTokens: 100, durationSec: 2 }), false);
+  assert.equal(isValidSpeedSample({ status: 'final', isSynthetic: true, outputTokens: 100, durationSec: 2 }), false);
+  assert.equal(isValidSpeedSample({ status: 'final', outputTokens: 0, durationSec: 2 }), false);
+  assert.equal(isValidSpeedSample({ status: 'final', outputTokens: 100, durationSec: 0 }), false);
+
+  const now = Date.parse('2026-11-13T12:00:00Z');
+  const calls = [
+    // 模型 A: 2 条有效样本 + 1 条无效估算（排除）+ 1 条缺失 ttft（保持 null）
+    { callId: 'a1', modelExactId: 'gemini-4-hydrogen-low', modelLabel: 'Gemini 4 Hydrogen (Low)', status: 'final', outputTokens: 100, durationSec: 2, tps: 50, timestamp: now - 1000 },
+    { callId: 'a2', modelExactId: 'gemini-4-hydrogen-low', modelLabel: 'Gemini 4 Hydrogen (Low)', status: 'final', outputTokens: 200, durationSec: 2, tps: 100, ttftSec: 0.8, timestamp: now - 500 },
+    { callId: 'a-est', modelExactId: 'gemini-4-hydrogen-low', modelLabel: 'Gemini 4 Hydrogen (Low)', status: 'final', isEstimated: true, outputTokens: 500, durationSec: 1, tps: 500, timestamp: now - 200 }
+  ];
+  // 模型 B: 205 条样本（最旧 5 条 tps=10 应被 200 条上限裁掉，最近 200 条 tps=80）
+  for (let i = 0; i < 205; i++) {
+    const isOld = i < 5;
+    calls.push({
+      callId: `b-${i}`,
+      modelExactId: 'claude-sonnet-4-6',
+      modelLabel: 'Claude Sonnet 4.6',
+      status: 'final',
+      outputTokens: isOld ? 20 : 160,
+      durationSec: 2,
+      tps: isOld ? 10 : 80,
+      ttftSec: 1.2,
+      timestamp: now - (205 - i) * 1000
+    });
+  }
+
+  assert.equal(MAX_SPEED_SAMPLES_PER_MODEL, 200);
+  const summary = summarizeSpeedByModel(calls, { nowMs: now });
+  const rowA = summary.find(r => r.modelExactId === 'gemini-4-hydrogen-low');
+  const rowB = summary.find(r => r.modelExactId === 'claude-sonnet-4-6');
+  assert.ok(rowA && rowB);
+  assert.equal(rowA.count, 2);
+  assert.equal(rowA.lowSample, true);
+  assert.equal(rowA.medianTps, 75);
+  assert.equal(rowA.medianTtft, 0.8); // 缺失 ttft 的 a1 不补零，仅按有效 ttft 计算
+  assert.equal(rowB.count, 200);
+  assert.equal(rowB.lowSample, false);
+  assert.equal(rowB.medianTps, 80);
+});
+
+test('groupModelProduct: Hydrogen 与 Hydrogen (XHigh) 归入同一模型产品，Carbon/Argon/Orchestrator 保持独立', () => {
+  const { groupModelProduct } = require('./meter-core');
+  const hMed = groupModelProduct('Gemini 4 Hydrogen (Medium)', 'gemini-4-hydrogen-medium');
+  const hXHigh = groupModelProduct('Gemini 4 Hydrogen (XHigh)', 'gemini-4-hydrogen-xhigh');
+  const argon = groupModelProduct('Gemini 4 Argon (High)', 'gemini-4-argon-high');
+  const carbon = groupModelProduct('Gemini 4 Carbon', 'gemini-4-carbon-disabled');
+  const orch = groupModelProduct('Orchestrator (Argon)', 'orchestrator-argon');
+
+  assert.equal(hMed.productKey, hXHigh.productKey);
+  assert.equal(hMed.productLabel, 'Gemini 4 Hydrogen');
+  assert.equal(hXHigh.effort, 'XHigh');
+  assert.notEqual(argon.productKey, hMed.productKey);
+  assert.notEqual(carbon.productKey, hMed.productKey);
+  assert.notEqual(orch.productKey, argon.productKey);
+});
+
+// --- PR #9 计价与账本对齐测试 ---
+const { resolveModelQuota } = require('./meter-core');
+// ============================================================================
+// Antigravity 2.31.2 回归测试：新模型计价/配额池、TTL 重扫解锁与账本-日志零双计对齐
+// ============================================================================
+test('2.31.2 model lineup: Gemini 4 Carbon (2026-11 vs 2026-12), Claude Opus/Sonnet 5.5, quota pool, and GPT-OSS unpriced invariant', () => {
+  const { resolveModelQuota, extractCallId } = require('./meter-core');
+
+  // 1. Gemini 4 Carbon: 2026-11 ($2 / $10 / $0.10) vs 2026-12 ($4 / $20 / $0.20)，无 >200K 溢价
+  const carbonNov = calculateRequestApiCost({
+    model: 'Gemini 4 Carbon (High)',
+    inputTokens: 250000,
+    cacheReadTokens: 100000,
+    outputTokens: 10000,
+    date: '2026-11-12'
+  });
+  assert.equal(carbonNov.isPriced, true);
+  assert.equal(carbonNov.modelKey, 'gemini-4-carbon');
+  // (0.25 * 2.0 + 0.1 * 0.10 + 0.01 * 10.0) = 0.50 + 0.01 + 0.10 = 0.61
+  assert.equal(carbonNov.costUSD, 0.61);
+
+  const carbonDec = calculateRequestApiCost({
+    responseModel: 'gemini-4-carbon',
+    inputTokens: 250000,
+    cacheReadTokens: 100000,
+    outputTokens: 10000,
+    date: '2026-12-01'
+  });
+  assert.equal(carbonDec.isPriced, true);
+  assert.equal(carbonDec.modelKey, 'gemini-4-carbon');
+  assert.equal(carbonDec.costUSD, 1.22);
+
+  // 2. Claude Opus 5.5 ($4 / $20 / $0.20) & Claude Sonnet 5.5 ($2 / $10 / $0.10)
+  const opus = calculateRequestApiCost({
+    model: 'Claude Opus 5.5 (Medium)',
+    inputTokens: 300000,
+    cacheReadTokens: 100000,
+    outputTokens: 5000,
+    date: '2026-11-12'
+  });
+  assert.equal(opus.isPriced, true);
+  assert.equal(opus.modelKey, 'claude-opus-5-5');
+  // (0.3 * 4.0 + 0.1 * 0.20 + 0.005 * 20.0) = 1.20 + 0.02 + 0.10 = 1.32
+  assert.equal(opus.costUSD, 1.32);
+
+  const sonnet = calculateRequestApiCost({
+    model: 'claude-sonnet-5-5-high',
+    inputTokens: 300000,
+    cacheReadTokens: 100000,
+    outputTokens: 5000,
+    date: '2026-11-12'
+  });
+  assert.equal(sonnet.isPriced, true);
+  assert.equal(sonnet.modelKey, 'claude-sonnet-5-5');
+  assert.equal(sonnet.costUSD, 0.66);
+
+  // 3. GPT-OSS 120B 保持未计价（无单一官方费率，绝不编造 $0）
+  const gptOss = calculateRequestApiCost({
+    model: 'GPT-OSS 120B (Medium)',
+    inputTokens: 10000,
+    outputTokens: 1000,
+    date: '2026-11-12'
+  });
+  assert.equal(gptOss.isPriced, false);
+  assert.equal(gptOss.modelKey, null);
+
+  // 4. Gemini 4 Carbon 配额池匹配（支持裸 responseModel 与具体档位 label）
+  const configs = [
+    { modelId: 'gemini-4-carbon-high', label: 'Gemini 4 Carbon (High)', quotaInfo: { remainingFraction: 0.894, resetTime: '2026-11-12T05:03:08Z' } }
+  ];
+  const quota = resolveModelQuota('gemini-4-carbon', configs);
+  assert.ok(quota);
+  assert.equal(quota.poolKey, 'gemini-4-carbon');
+  assert.equal(quota.poolName, 'Gemini 4 Carbon 配额池');
+  assert.equal(quota.remainingFraction, 0.894);
+
+  // 5. parseGeneratorCall 持久化 stepIndex、totalTokens 并统一 extractCallId 优先级
+  const parsed = parseGeneratorCall({
+    stepIndices: [5, 6],
+    callId: 'lower-priority-call-id',
+    chatModel: {
+      modelDisplayName: 'Gemini 4 Carbon (High)',
+      responseModel: 'gemini-4-carbon',
+      usage: {
+        inputTokens: '2000',
+        cacheReadTokens: '3000',
+        outputTokens: '500',
+        responseId: 'Lzj1atubDv'
+      }
+    }
+  }, '929f8a67-2f81-47e0-bf59-2f7af9aefcaf', 'desktop');
+  assert.equal(parsed.callId, 'Lzj1atubDv');
+  assert.equal(extractCallId({ callId: 'lower-priority-call-id', chatModel: { usage: { responseId: 'Lzj1atubDv' } } }), 'Lzj1atubDv');
+  assert.equal(parsed.stepIndex, 5);
+  assert.equal(parsed.totalTokens, 5500);
+  assert.equal(parsed.isPriced, true);
+});
+
+test('collectTokenHistoryAsync default branch (!options.agDir) clears activeScanPromise and refreshes after 15s TTL', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const tempAgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-default-branch-'));
+  const tempCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-default-cli-'));
+  const prevAgDir = process.env.AG_DIR;
+  const prevAgCliDir = process.env.AG_CLI_DIR;
+  const realDateNow = Date.now;
+  let fakeNow = realDateNow.call(Date) + 120000;
+
+  try {
+    process.env.AG_DIR = tempAgDir;
+    process.env.AG_CLI_DIR = tempCliDir;
+    Date.now = () => fakeNow;
+
+    const convUuid = 'aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb';
+    const logDir = path.join(tempAgDir, 'brain', convUuid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    const transcriptPath = path.join(logDir, 'transcript.jsonl');
+    const nowIso = new Date().toISOString();
+
+    fs.writeFileSync(
+      transcriptPath,
+      JSON.stringify({
+        step_index: 2,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: nowIso,
+        input_tokens: 1000,
+        cache_read_tokens: 500,
+        output_tokens: 200
+      }) + '\n',
+      'utf8'
+    );
+
+    const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+    // 先用 force: true 初始化全局默认分支基准缓存，随后走真实 !options.force && !options.agDir 路径
+    const r1 = await collectTokenHistoryAsync({ force: true, userStatus: mockUserStatus });
+    assert.equal(r1.summary.grandTotalTokens, 1700);
+
+    // 追加新一轮 PLANNER_RESPONSE 步骤
+    fs.appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        step_index: 5,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: nowIso,
+        input_tokens: 3000,
+        cache_read_tokens: 1000,
+        output_tokens: 400
+      }) + '\n',
+      'utf8'
+    );
+
+    // TTL 15s 内：force: false 返回内存缓存
+    fakeNow += 5000;
+    const rWithinTtl = await collectTokenHistoryAsync({ force: false, userStatus: mockUserStatus });
+    assert.equal(rWithinTtl.summary.grandTotalTokens, 1700);
+
+    // 跨过 15s TTL（+16000ms）：force: false 必须释放已完成的 activeScanPromise 并重扫出最新 6100 tokens！
+    fakeNow += 12000;
+    const rAfterTtl = await collectTokenHistoryAsync({ force: false, userStatus: mockUserStatus });
+    assert.equal(rAfterTtl.summary.grandTotalTokens, 6100);
+    assert.equal(rAfterTtl.summary.todayTokens, 6100);
+  } finally {
+    Date.now = realDateNow;
+    if (prevAgDir === undefined) delete process.env.AG_DIR;
+    else process.env.AG_DIR = prevAgDir;
+    if (prevAgCliDir === undefined) delete process.env.AG_CLI_DIR;
+    else process.env.AG_CLI_DIR = prevAgCliDir;
+    fs.rmSync(tempAgDir, { recursive: true, force: true });
+    fs.rmSync(tempCliDir, { recursive: true, force: true });
+  }
+});
+
+test('ledger & transcript alignment: zero double-counting of unpriced/priced calls across All, Desktop, Cli, and CurrentMonth', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { savePricingLedger, formatLocalDateKey } = require('./meter-collector');
+
+  const tempAgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-align-ag-'));
+  const tempCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-align-cli-'));
+  try {
+    const now = new Date();
+    const todayIso = now.toISOString();
+    const todayLocal = formatLocalDateKey(now);
+    const cid = '929f8a67-2f81-47e0-bf59-2f7af9aefcaf';
+
+    // 构造真实 2.31.2 账本：
+    // 1) 100-token 未计价请求 (GPT-OSS 120B, legacy 无 stepIndex, callId=responseId) -> 仅计 100 unpriced (绝不翻倍为 200)
+    // 2) 100-token 未计价请求 (共享显式 callId) -> 仅计 100 unpriced (绝不翻倍为 200)
+    // 3) 1000-token 历史 Gemini 4 Carbon 请求 (磁盘旧状态 isPriced: false, 含 stepIndex: 6) -> 动态重算为已计价，且不额外计入 missingModel
+    savePricingLedger({
+      version: '1.0.0',
+      updatedAt: todayIso,
+      calls: {
+        resp_legacy_unpriced_1: {
+          callId: 'resp_legacy_unpriced_1',
+          source: 'desktop',
+          cascadeId: cid,
+          model: 'GPT-OSS 120B (Medium)',
+          modelKey: null,
+          inputTokens: 60,
+          cacheTokens: 20,
+          cacheReadTokens: 20,
+          outputTokens: 20,
+          status: 'final',
+          isPriced: false,
+          costUSD: 0,
+          date: todayLocal,
+          created_at: todayIso
+        },
+        shared_unpriced_call_2: {
+          callId: 'shared_unpriced_call_2',
+          source: 'desktop',
+          cascadeId: cid,
+          stepIndex: 4,
+          model: 'GPT-OSS 120B (Medium)',
+          modelKey: null,
+          inputTokens: 70,
+          cacheTokens: 10,
+          cacheReadTokens: 10,
+          outputTokens: 20,
+          totalTokens: 100,
+          status: 'final',
+          isPriced: false,
+          costUSD: 0,
+          date: todayLocal,
+          created_at: todayIso
+        },
+        resp_carbon_retro_3: {
+          callId: 'resp_carbon_retro_3',
+          source: 'desktop',
+          cascadeId: cid,
+          stepIndex: 6,
+          model: 'Gemini 4 Carbon (High)',
+          modelKey: null,
+          inputTokens: 500,
+          cacheTokens: 300,
+          cacheReadTokens: 300,
+          outputTokens: 200,
+          status: 'final',
+          isPriced: false, // 模拟旧版本落盘状态
+          costUSD: 0,
+          date: todayLocal,
+          created_at: todayIso
+        }
+      }
+    }, tempAgDir);
+
+    // 写入对应真实无 model、无 responseId 的桌面端 transcript.jsonl + 1 条未入账的 50-token 历史步骤
+    const deskLogDir = path.join(tempAgDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(deskLogDir, { recursive: true });
+    const deskLines = [
+      // 匹配 resp_legacy_unpriced_1 (Pass 2: 用量指纹 60/20/20 = 100 tok)
+      { step_index: 2, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: todayIso, input_tokens: 60, cache_read_tokens: 20, output_tokens: 20 },
+      // 匹配 shared_unpriced_call_2 (Pass 1: callId / stepIndex 4 = 100 tok)
+      { step_index: 4, callId: 'shared_unpriced_call_2', source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: todayIso, input_tokens: 70, cache_read_tokens: 10, output_tokens: 20 },
+      // 匹配 resp_carbon_retro_3 (Pass 1: stepIndex 6 = 1000 tok)
+      { step_index: 6, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: todayIso, input_tokens: 500, cache_read_tokens: 300, output_tokens: 200 },
+      // 未被账本覆盖的桌面端步骤 (50 tok -> missingModel)
+      { step_index: 8, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: todayIso, input_tokens: 30, cache_read_tokens: 10, output_tokens: 10 }
+    ];
+    fs.writeFileSync(path.join(deskLogDir, 'transcript.jsonl'), deskLines.map(x => JSON.stringify(x)).join('\n') + '\n', 'utf8');
+
+    // 写入 1 条未被账本覆盖的 CLI 步骤 (80 tok -> missingModel)
+    const cliLogDir = path.join(tempCliDir, 'brain', 'bbbbbbbb-2222-3333-4444-cccccccccccc', '.system_generated', 'logs');
+    fs.mkdirSync(cliLogDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(cliLogDir, 'transcript.jsonl'),
+      JSON.stringify({ step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE', created_at: todayIso, input_tokens: 50, cache_read_tokens: 10, output_tokens: 20 }) + '\n',
+      'utf8'
+    );
+
+    const data = await collectTokenHistoryAsync({
+      force: true,
+      agDir: tempAgDir,
+      agCliDir: tempCliDir,
+      userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } }
+    });
+
+    // 桌面端：1 条已计价 (1000 tok)，3 条未计价 = 2 条账本 GPT-OSS (100+100=200 tok, unsupportedModel: 2) + 1 条未匹配步骤 (50 tok, missingModel: 1) => 250 tok (绝非 450/1450!)
+    const desk = data.costEstimateBySource.desktop;
+    assert.equal(desk.pricedRequestsCount, 1);
+    assert.equal(desk.pricedTokens, 1000);
+    assert.equal(desk.unpricedRequestsCount, 3);
+    assert.equal(desk.unpricedTokens, 250);
+    assert.equal(desk.unpricedReasons.unsupportedModel, 2);
+    assert.equal(desk.unpricedReasons.missingModel, 1);
+
+    // CLI 端：0 条已计价，1 条未计价 (80 tok, missingModel: 1)
+    const cli = data.costEstimateBySource.cli;
+    assert.equal(cli.pricedRequestsCount, 0);
+    assert.equal(cli.unpricedRequestsCount, 1);
+    assert.equal(cli.unpricedTokens, 80);
+    assert.equal(cli.unpricedReasons.missingModel, 1);
+
+    // 全量 (All) 与 本期自然月 (CurrentMonth) 完全一致且零双计：已计价 1000 tok，未计价 250 + 80 = 330 tok
+    for (const summary of [data.costEstimate, data.costEstimateCurrentMonth]) {
+      assert.equal(summary.pricedRequestsCount, 1);
+      assert.equal(summary.pricedTokens, 1000);
+      assert.equal(summary.unpricedRequestsCount, 4);
+      assert.equal(summary.unpricedTokens, 330);
+      assert.equal(summary.unpricedReasons.unsupportedModel, 2);
+      assert.equal(summary.unpricedReasons.missingModel, 2);
+    }
+
+    // 混合模式残差同样精确等于 330 未计价 tokens
+    assert.equal(data.referenceCost.hybrid.hybrid.unpricedResidualTokens, 330);
+    assert.equal(data.referenceCost.currentMonthHybrid.hybrid.unpricedResidualTokens, 330);
+  } finally {
+    fs.rmSync(tempAgDir, { recursive: true, force: true });
+    fs.rmSync(tempCliDir, { recursive: true, force: true });
+  }
+});
+
+test('RPC responseId + model-bearing transcript cascadeId#stepIndex never double-prices in [RPC -> Scan] or [Scan -> RPC] orders', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger, formatLocalDateKey } = require('./meter-collector');
+
+  const now = new Date();
+  const todayIso = now.toISOString();
+  const todayLocal = formatLocalDateKey(now);
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+
+  // 场景 A: [RPC -> Scan] 顺序（账本已有 responseId 100 tok，随后扫描带 model 且无 responseId 的 transcript cascadeId#stepIndex）
+  const agDirA = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-rpc-then-scan-'));
+  const cliDirA = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-rpc-then-scan-cli-'));
+  try {
+    const cidA = '11111111-2222-3333-4444-555555555555';
+    const rpcCall = parseGeneratorCall({
+      created_at: todayIso,
+      stepIndices: [3],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 60, cacheReadTokens: 20, outputTokens: 20, responseId: 'resp_rpc_first_100' }
+      }
+    }, cidA, 'desktop');
+    recordModelCalls([rpcCall], { agDir: agDirA });
+
+    const logDirA = path.join(agDirA, 'brain', cidA, '.system_generated', 'logs');
+    fs.mkdirSync(logDirA, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDirA, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: todayIso,
+        model: 'Gemini 4 Carbon (High)',
+        input_tokens: 60,
+        cache_read_tokens: 20,
+        output_tokens: 20
+      }) + '\n',
+      'utf8'
+    );
+
+    const resA = await collectTokenHistoryAsync({ force: true, agDir: agDirA, agCliDir: cliDirA, userStatus: mockUserStatus });
+    const ledgerKeysA = Object.keys(loadPricingLedger(agDirA).calls || {});
+    assert.deepEqual(ledgerKeysA, ['resp_rpc_first_100']);
+    assert.equal(resA.costEstimate.pricedRequestsCount, 1);
+    assert.equal(resA.costEstimate.pricedTokens, 100);
+    assert.equal(resA.costEstimate.unpricedRequestsCount, 0);
+    assert.equal(resA.costEstimate.unpricedTokens, 0);
+    assert.equal(resA.costEstimateCurrentMonth.pricedRequestsCount, 1);
+    assert.equal(resA.costEstimateCurrentMonth.pricedTokens, 100);
+  } finally {
+    fs.rmSync(agDirA, { recursive: true, force: true });
+    fs.rmSync(cliDirA, { recursive: true, force: true });
+  }
+
+  // 场景 B: [Scan -> RPC] 顺序（扫描先写入 cascadeId#stepIndex 100 tok，随后 RPC 写入真实 responseId 100 tok）
+  const agDirB = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-scan-then-rpc-'));
+  const cliDirB = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-scan-then-rpc-cli-'));
+  try {
+    const cidB = '66666666-7777-8888-9999-aaaaaaaaaaaa';
+    const logDirB = path.join(agDirB, 'brain', cidB, '.system_generated', 'logs');
+    fs.mkdirSync(logDirB, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDirB, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: todayIso,
+        model: 'Gemini 4 Carbon (High)',
+        input_tokens: 60,
+        cache_read_tokens: 20,
+        output_tokens: 20
+      }) + '\n',
+      'utf8'
+    );
+
+    const resBeforeRpc = await collectTokenHistoryAsync({ force: true, agDir: agDirB, agCliDir: cliDirB, userStatus: mockUserStatus });
+    assert.deepEqual(Object.keys(loadPricingLedger(agDirB).calls || {}), [`${cidB}#3`]);
+    assert.equal(resBeforeRpc.costEstimate.pricedRequestsCount, 1);
+    assert.equal(resBeforeRpc.costEstimate.pricedTokens, 100);
+
+    const rpcCallLater = parseGeneratorCall({
+      created_at: todayIso,
+      stepIndices: [3],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 60, cacheReadTokens: 20, outputTokens: 20, responseId: 'resp_rpc_after_scan_100' }
+      }
+    }, cidB, 'desktop');
+    recordModelCalls([rpcCallLater], { agDir: agDirB });
+
+    // 合成键已原地迁移为真实 responseId，且再次传入合成键绝不重复新增
+    assert.deepEqual(Object.keys(loadPricingLedger(agDirB).calls || {}), ['resp_rpc_after_scan_100']);
+    recordModelCalls([{
+      callId: `${cidB}#3`,
+      source: 'desktop',
+      cascadeId: cidB,
+      stepIndex: 3,
+      model: 'Gemini 4 Carbon (High)',
+      modelKey: 'gemini-4-carbon',
+      inputTokens: 60,
+      cacheTokens: 20,
+      outputTokens: 20,
+      totalTokens: 100,
+      status: 'final',
+      isPriced: true,
+      costUSD: rpcCallLater.costUSD,
+      date: todayLocal
+    }], { agDir: agDirB });
+    assert.deepEqual(Object.keys(loadPricingLedger(agDirB).calls || {}), ['resp_rpc_after_scan_100']);
+
+    const resAfterRpc = await collectTokenHistoryAsync({ force: true, agDir: agDirB, agCliDir: cliDirB, userStatus: mockUserStatus });
+    assert.equal(resAfterRpc.costEstimate.pricedRequestsCount, 1);
+    assert.equal(resAfterRpc.costEstimate.pricedTokens, 100);
+    assert.equal(resAfterRpc.costEstimate.unpricedRequestsCount, 0);
+    assert.equal(resAfterRpc.costEstimate.unpricedTokens, 0);
+    assert.equal(resAfterRpc.costEstimateCurrentMonth.pricedRequestsCount, 1);
+    assert.equal(resAfterRpc.costEstimateCurrentMonth.pricedTokens, 100);
+  } finally {
+    fs.rmSync(agDirB, { recursive: true, force: true });
+    fs.rmSync(cliDirB, { recursive: true, force: true });
+  }
+});
+
+test('v2 archive-only usage (200 archived tokens + 100 priced ledger tokens) reports 100 unpriced tokens and 50% coverage in monthly and all-time', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { savePricingLedger, formatLocalDateKey } = require('./meter-collector');
+
+  const tempAgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-v2-archive-cov-'));
+  const tempCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-v2-archive-cli-'));
+  try {
+    const now = new Date();
+    const todayIso = now.toISOString();
+    const todayLocal = formatLocalDateKey(now);
+
+    // 仅存在 v2 归档（200 tokens, 2 steps），无任何实时 transcript.jsonl
+    fs.writeFileSync(path.join(tempAgDir, 'token_usage_archive_v2.json'), JSON.stringify({
+      version: '2.0.0',
+      firstUseDate: todayLocal,
+      updatedAt: `${todayLocal} 09:00:00`,
+      maxConversations: 2,
+      dailyMapBySource: {
+        desktop: {
+          [todayLocal]: { total: 200, input: 120, cache: 40, output: 40, steps: 2 }
+        },
+        cli: {}
+      }
+    }, null, 2), 'utf8');
+
+    // 账本中仅有 1 条 100-token 已计价记录
+    savePricingLedger({
+      version: '1.0.0',
+      updatedAt: todayIso,
+      calls: {
+        resp_archived_100: {
+          callId: 'resp_archived_100',
+          source: 'desktop',
+          cascadeId: '27c2de70-1111-2222-3333-444444444444',
+          stepIndex: 1,
+          model: 'Gemini 4 Carbon (High)',
+          modelKey: 'gemini-4-carbon',
+          inputTokens: 60,
+          cacheTokens: 20,
+          cacheReadTokens: 20,
+          outputTokens: 20,
+          totalTokens: 100,
+          status: 'final',
+          isPriced: true,
+          costUSD: 0.000322,
+          date: todayLocal,
+          created_at: todayIso
+        }
+      }
+    }, tempAgDir);
+
+    const data = await collectTokenHistoryAsync({
+      force: true,
+      agDir: tempAgDir,
+      agCliDir: tempCliDir,
+      userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } }
+    });
+
+    assert.equal(data.summary.grandTotalTokens, 200);
+    assert.equal(data.summary.monthTokens, 200);
+
+    for (const summary of [data.costEstimate, data.costEstimateBySource.desktop, data.costEstimateCurrentMonth]) {
+      assert.equal(summary.pricedRequestsCount, 1);
+      assert.equal(summary.pricedTokens, 100);
+      assert.equal(summary.unpricedRequestsCount, 1);
+      assert.equal(summary.unpricedTokens, 100);
+      assert.equal(summary.tokenCoveragePercent, 50);
+      assert.equal(summary.requestCoveragePercent, 50);
+      assert.equal(summary.coveragePercent, 50);
+      assert.equal(summary.isPartialCoverage, true);
+    }
+
+    assert.equal(data.referenceCost.hybrid.hybrid.unpricedResidualTokens, 100);
+    assert.equal(data.referenceCost.currentMonthHybrid.hybrid.unpricedResidualTokens, 100);
+
+    // 直接校验 summarizeApiCost 防卫：即便 unpricedRequestsCount === 0，只要 unpricedTokens > 0 也绝不能返回 100%
+    const directGuard = summarizeApiCost(
+      [{ model: 'Gemini 4 Carbon (High)', inputTokens: 60, cacheTokens: 20, outputTokens: 20, date: '2026-11-12' }],
+      0,
+      {},
+      100
+    );
+    assert.equal(directGuard.tokenCoveragePercent, 50);
+    assert.equal(directGuard.coveragePercent, 50);
+    assert.equal(directGuard.isPartialCoverage, true);
+  } finally {
+    fs.rmSync(tempAgDir, { recursive: true, force: true });
+    fs.rmSync(tempCliDir, { recursive: true, force: true });
+  }
+});
+
+test('Claude 5 vs Claude 5.5 strict alias matching: claude-opus-5 and claude-sonnet-5 stay unpriced while 5.5 is priced', () => {
+  const { normalizeModelId } = require('./meter-core');
+
+  // 非 5.5 的 Claude 5 系列变体必须保持 null（未计价），绝不误归入 5.5 费率
+  for (const unpricedRaw of [
+    'claude-opus-5',
+    'claude-opus-5-20260514',
+    'claude-opus-5-0',
+    'Claude Opus 5',
+    'claude-opus-5-50',
+    'claude-sonnet-5',
+    'claude-sonnet-5-20260514',
+    'claude-sonnet-5-0',
+    'Claude Sonnet 5'
+  ]) {
+    assert.equal(normalizeModelId(unpricedRaw), null, `expected ${unpricedRaw} to remain unnormalized`);
+    const calc = calculateRequestApiCost({ model: unpricedRaw, inputTokens: 10000, outputTokens: 1000, date: '2026-11-12' });
+    assert.equal(calc.isPriced, false, `expected ${unpricedRaw} to stay unpriced`);
+  }
+
+  // 明确的 5.5 / 5-5 变体正常识别计价
+  for (const [raw55, expectedKey] of [
+    ['claude-opus-5-5', 'claude-opus-5-5'],
+    ['Claude Opus 5.5 (Thinking)', 'claude-opus-5-5'],
+    ['claude-opus-5.5-20261101', 'claude-opus-5-5'],
+    ['claude-sonnet-5-5', 'claude-sonnet-5-5'],
+    ['Claude Sonnet 5.5 (High)', 'claude-sonnet-5-5'],
+    ['claude-sonnet-5.5-20261101', 'claude-sonnet-5-5']
+  ]) {
+    assert.equal(normalizeModelId(raw55), expectedKey, `expected ${raw55} -> ${expectedKey}`);
+    const calc = calculateRequestApiCost({ model: raw55, inputTokens: 10000, outputTokens: 1000, date: '2026-11-12' });
+    assert.equal(calc.isPriced, true, `expected ${raw55} to be priced`);
+  }
+});
+
+test('two distinct real responseId calls in the same step (100 + 120 = 220 tokens) are both preserved without merging', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger } = require('./meter-collector');
+
+  const nowIso = new Date().toISOString();
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-same-step-two-real-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-same-step-two-real-cli-'));
+
+  try {
+    const cid = '33333333-4444-5555-6666-777777777777';
+    // 先模拟扫描产生合成键 cid#3 (100 tok)，再写入同步骤两条独立真实 responseId (100 + 120 = 220 tok)
+    const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, 'transcript.jsonl'),
+      [
+        {
+          step_index: 3,
+          callId: 'resp_step3_call_a',
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: nowIso,
+          input_tokens: 60,
+          cache_read_tokens: 20,
+          output_tokens: 20
+        },
+        {
+          step_index: 3,
+          callId: 'resp_step3_call_b',
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: nowIso,
+          input_tokens: 70,
+          cache_read_tokens: 20,
+          output_tokens: 30
+        }
+      ].map(x => JSON.stringify(x)).join('\n') + '\n',
+      'utf8'
+    );
+
+    const callA = parseGeneratorCall({
+      created_at: nowIso,
+      stepIndices: [3],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 60, cacheReadTokens: 20, outputTokens: 20, responseId: 'resp_step3_call_a' }
+      }
+    }, cid, 'desktop');
+    const callB = parseGeneratorCall({
+      created_at: nowIso,
+      stepIndices: [3],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 70, cacheReadTokens: 20, outputTokens: 30, responseId: 'resp_step3_call_b' }
+      }
+    }, cid, 'desktop');
+
+    // 先插入一条合成兜底键，验证第一条真实 ID 升级合成键后，第二条同步骤真实 ID 绝不吞并第一条真实 ID
+    recordModelCalls([{
+      ...callA,
+      callId: `${cid}#3`
+    }], { agDir });
+    recordModelCalls([callA, callB], { agDir });
+
+    const callsMap = loadPricingLedger(agDir).calls || {};
+    assert.deepEqual(Object.keys(callsMap).sort(), ['resp_step3_call_a', 'resp_step3_call_b']);
+    assert.equal(callsMap.resp_step3_call_a.totalTokens, 100);
+    assert.equal(callsMap.resp_step3_call_b.totalTokens, 120);
+
+    const scanRes = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    assert.equal(scanRes.costEstimate.pricedRequestsCount, 2);
+    assert.equal(scanRes.costEstimate.pricedTokens, 220);
+    assert.equal(scanRes.costEstimate.unpricedRequestsCount, 0);
+    assert.equal(scanRes.costEstimate.unpricedTokens, 0);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+
+test('pre-seeded duplicate (responseId, cascadeId#stepIndex) reconciles to 100 priced tokens on read and cleans up synthetic key on write', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger, formatLocalDateKey } = require('./meter-collector');
+
+  const now = new Date();
+  const todayIso = now.toISOString();
+  const todayLocal = formatLocalDateKey(now);
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+
+  for (const includeStepOnReal of [true, false]) {
+    const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-preseed-dup-'));
+    const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-preseed-dup-cli-'));
+    try {
+      const cid = '88888888-9999-aaaa-bbbb-cccccccccccc';
+      const ledgerPath = path.join(agDir, 'pricing_ledger_v1.json');
+
+      // 预置旧版遗留双键：真实 responseId (含或不含 stepIndex) + 合成键 cid#4 (均为 100 tokens)
+      const realEntry = {
+        callId: 'resp_preseeded_100',
+        source: 'desktop',
+        cascadeId: cid,
+        ...(includeStepOnReal ? { stepIndex: 4 } : {}),
+        model: 'Gemini 4 Carbon (High)',
+        modelKey: 'gemini-4-carbon',
+        inputTokens: 60,
+        cacheTokens: 20,
+        cacheReadTokens: 20,
+        outputTokens: 20,
+        totalTokens: 100,
+        status: 'final',
+        isPriced: true,
+        costUSD: 0.000322,
+        date: todayLocal,
+        created_at: todayIso
+      };
+      const synEntry = {
+        ...realEntry,
+        callId: `${cid}#4`,
+        stepIndex: 4
+      };
+      fs.writeFileSync(ledgerPath, JSON.stringify({
+        version: '1.0.0',
+        updatedAt: todayIso,
+        calls: {
+          resp_preseeded_100: realEntry,
+          [`${cid}#4`]: synEntry
+        }
+      }, null, 2), 'utf8');
+
+      const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(logDir, 'transcript.jsonl'),
+        JSON.stringify({
+          step_index: 4,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: todayIso,
+          model: 'Gemini 4 Carbon (High)',
+          input_tokens: 60,
+          cache_read_tokens: 20,
+          output_tokens: 20
+        }) + '\n',
+        'utf8'
+      );
+
+      // 1) 纯读取路径不改写磁盘，但内存态立即消解为单条 100 tokens（绝不翻倍为 200）
+      const memBeforeWrite = loadPricingLedger(agDir);
+      assert.deepEqual(Object.keys(memBeforeWrite.calls), ['resp_preseeded_100']);
+      assert.equal(memBeforeWrite.calls.resp_preseeded_100.stepIndex, 4);
+      const rawDiskBeforeWrite = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+      assert.equal(Object.keys(rawDiskBeforeWrite.calls).length, 2, 'pure loadPricingLedger read must not mutate disk');
+
+      const scanRes = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+      assert.equal(scanRes.costEstimate.pricedRequestsCount, 1);
+      assert.equal(scanRes.costEstimate.pricedTokens, 100);
+      assert.equal(scanRes.costEstimate.unpricedRequestsCount, 0);
+      assert.equal(scanRes.costEstimate.unpricedTokens, 0);
+
+      // 2) 再次以真实 responseId 调用 recordModelCalls 时，磁盘上的遗留合成键被彻底清除并持久化
+      const recRes = recordModelCalls([realEntry], { agDir });
+      assert.equal(recRes.ok, true);
+      const rawDiskAfterWrite = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+      assert.deepEqual(Object.keys(rawDiskAfterWrite.calls), ['resp_preseeded_100']);
+      assert.equal(rawDiskAfterWrite.calls.resp_preseeded_100.stepIndex, 4);
+      assert.equal(rawDiskAfterWrite.__hadDuplicateStepKeys, undefined);
+    } finally {
+      fs.rmSync(agDir, { recursive: true, force: true });
+      fs.rmSync(cliDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('matched transcript with richer model and 120 tokens enriches model-less 100-token ledger entry into 1 priced call of 120 tokens', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { savePricingLedger, loadPricingLedger, recordModelCalls, formatLocalDateKey } = require('./meter-collector');
+
+  const now = new Date();
+  const todayIso = now.toISOString();
+  const todayLocal = formatLocalDateKey(now);
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-enrich-ledger-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-enrich-cli-'));
+  try {
+    const cid = 'dddddddd-eeee-4444-8888-ffffffffffff';
+
+    // 账本已有 { callId: "x", model: "", 100 tokens }（未计价）
+    savePricingLedger({
+      version: '1.0.0',
+      updatedAt: todayIso,
+      calls: {
+        x: {
+          callId: 'x',
+          source: 'desktop',
+          cascadeId: cid,
+          model: '',
+          modelKey: null,
+          inputTokens: 60,
+          cacheTokens: 20,
+          cacheReadTokens: 20,
+          outputTokens: 20,
+          totalTokens: 100,
+          status: 'final',
+          isPriced: false,
+          costUSD: 0,
+          date: todayLocal,
+          created_at: todayIso
+        }
+      }
+    }, agDir);
+
+    // transcript 含同一 callId: "x"、完整 model: "Gemini 4 Carbon" 与更新的 120 tokens
+    const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 2,
+        callId: 'x',
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: todayIso,
+        model: 'Gemini 4 Carbon',
+        input_tokens: 70,
+        cache_read_tokens: 20,
+        output_tokens: 30
+      }) + '\n',
+      'utf8'
+    );
+
+    const res = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    const updatedCalls = loadPricingLedger(agDir).calls || {};
+    assert.deepEqual(Object.keys(updatedCalls), ['x']);
+    assert.equal(updatedCalls.x.model, 'Gemini 4 Carbon');
+    assert.equal(updatedCalls.x.totalTokens, 120);
+    assert.equal(updatedCalls.x.isPriced, true);
+
+    assert.equal(res.costEstimate.pricedRequestsCount, 1);
+    assert.equal(res.costEstimate.pricedTokens, 120);
+    assert.equal(res.costEstimate.unpricedRequestsCount, 0);
+    assert.equal(res.costEstimate.unpricedTokens, 0);
+    assert.equal(res.costEstimateCurrentMonth.pricedRequestsCount, 1);
+    assert.equal(res.costEstimateCurrentMonth.pricedTokens, 120);
+
+    // 反向防回退校验：若账本已有 120 tokens (缺 model) 而后到记录含 model 但仅 100 tokens，必须补齐 model 且保留 120 tokens
+    recordModelCalls([{
+      callId: 'y',
+      source: 'desktop',
+      cascadeId: cid,
+      stepIndex: 5,
+      model: '',
+      inputTokens: 70,
+      cacheTokens: 20,
+      outputTokens: 30,
+      status: 'final',
+      isPriced: false,
+      costUSD: 0,
+      date: todayLocal
+    }], { agDir });
+    recordModelCalls([{
+      callId: 'y',
+      source: 'desktop',
+      cascadeId: cid,
+      stepIndex: 5,
+      model: 'Gemini 4 Carbon',
+      inputTokens: 60,
+      cacheTokens: 20,
+      outputTokens: 20,
+      status: 'final',
+      isPriced: true,
+      costUSD: 0.000322,
+      date: todayLocal
+    }], { agDir });
+    const entryY = loadPricingLedger(agDir).calls.y;
+    assert.equal(entryY.model, 'Gemini 4 Carbon');
+    assert.equal(entryY.totalTokens, 120);
+    assert.equal(entryY.outputTokens, 30);
+    assert.equal(entryY.isPriced, true);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+
+test('order-independent synthetic-key migration & insufficient-evidence preservation (120-tok synthetic + [real_100, real_120] / sequential / [real_80, real_100])', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger } = require('./meter-collector');
+
+  const nowIso = new Date().toISOString();
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+  const cid = 'conv1-4444-5555-6666-777777777777';
+
+  const makeRpcCall = (responseId, inp, cap, out) => parseGeneratorCall({
+    created_at: nowIso,
+    stepIndices: [5],
+    chatModel: {
+      modelDisplayName: 'Gemini 4 Carbon (High)',
+      responseModel: 'gemini-4-carbon',
+      usage: { inputTokens: inp, cacheReadTokens: cap, outputTokens: out, responseId }
+    }
+  }, cid, 'desktop');
+
+  const real80 = makeRpcCall('resp_80', 50, 10, 20);
+  const real100 = makeRpcCall('resp_100', 60, 20, 20);
+  const real120 = makeRpcCall('resp_120', 70, 20, 30);
+  const syn120 = { ...real120, callId: `${cid}#5` };
+
+  const writeTranscript120 = (agDir) => {
+    const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 5,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: nowIso,
+        model: 'Gemini 4 Carbon (High)',
+        input_tokens: 70,
+        cache_read_tokens: 20,
+        output_tokens: 30
+      }) + '\n',
+      'utf8'
+    );
+  };
+
+  // 1) & 2) 单批次两种排列顺序：[real_100, real_120] 与 [real_120, real_100] 均精确得到 220 tokens (绝非 240)
+  for (const batchOrder of [[real100, real120], [real120, real100]]) {
+    const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-order-indep-batch-'));
+    const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-order-indep-cli-'));
+    try {
+      writeTranscript120(agDir);
+      recordModelCalls([syn120], { agDir });
+      recordModelCalls(batchOrder, { agDir });
+
+      const calls = loadPricingLedger(agDir).calls || {};
+      assert.deepEqual(Object.keys(calls).sort(), ['resp_100', 'resp_120']);
+      assert.equal(calls.resp_100.totalTokens, 100);
+      assert.equal(calls.resp_120.totalTokens, 120);
+
+      const scan = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+      assert.equal(scan.costEstimate.pricedRequestsCount, 2);
+      assert.equal(scan.costEstimate.pricedTokens, 220);
+      assert.equal(scan.costEstimate.unpricedTokens, 0);
+    } finally {
+      fs.rmSync(agDir, { recursive: true, force: true });
+      fs.rmSync(cliDir, { recursive: true, force: true });
+    }
+  }
+
+  // 3) 分批先后到达：先有 120-tok 合成记录 -> 先仅到达 real_100 (中间态保留 resp_100 + conv1#5 = 220 tok) -> 重扫仍为 220 tok -> 后到达 real_120 (消解为 resp_100 + resp_120 = 220 tok)
+  const agSeq = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-order-indep-seq-'));
+  const cliSeq = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-order-indep-seq-cli-'));
+  try {
+    writeTranscript120(agSeq);
+    const scanInitial = await collectTokenHistoryAsync({ force: true, agDir: agSeq, agCliDir: cliSeq, userStatus: mockUserStatus });
+    assert.deepEqual(Object.keys(loadPricingLedger(agSeq).calls || {}), [`${cid}#5`]);
+    assert.equal(scanInitial.costEstimate.pricedTokens, 120);
+
+    // real_100 先到达：由于两者均为已完结且含模型、用量 100 !== 120，证据不足绝不误合并，保持 100 + 120 = 220
+    recordModelCalls([real100], { agDir: agSeq });
+    const midCalls = loadPricingLedger(agSeq).calls || {};
+    assert.deepEqual(Object.keys(midCalls).sort(), [`${cid}#5`, 'resp_100']);
+    assert.equal(midCalls.resp_100.totalTokens, 100);
+    assert.equal(midCalls[`${cid}#5`].totalTokens, 120);
+
+    const scanMid = await collectTokenHistoryAsync({ force: true, agDir: agSeq, agCliDir: cliSeq, userStatus: mockUserStatus });
+    assert.equal(scanMid.costEstimate.pricedRequestsCount, 2);
+    assert.equal(scanMid.costEstimate.pricedTokens, 220);
+    assert.equal(scanMid.costEstimate.unpricedTokens, 0);
+
+    // real_120 随后到达：精确匹配 120-tok 合成键并完成迁移，最终仅保留 resp_100 + resp_120 = 220
+    recordModelCalls([real120], { agDir: agSeq });
+    const finalCalls = loadPricingLedger(agSeq).calls || {};
+    assert.deepEqual(Object.keys(finalCalls).sort(), ['resp_100', 'resp_120']);
+    assert.equal(finalCalls.resp_100.totalTokens, 100);
+    assert.equal(finalCalls.resp_120.totalTokens, 120);
+
+    const scanFinal = await collectTokenHistoryAsync({ force: true, agDir: agSeq, agCliDir: cliSeq, userStatus: mockUserStatus });
+    assert.equal(scanFinal.costEstimate.pricedRequestsCount, 2);
+    assert.equal(scanFinal.costEstimate.pricedTokens, 220);
+  } finally {
+    fs.rmSync(agSeq, { recursive: true, force: true });
+    fs.rmSync(cliSeq, { recursive: true, force: true });
+  }
+
+  // 4) 证据不足保护：合成键 120 tok，RPC 返回 [real_80, real_100]（均不等于 120）-> 三条记录全部保留 (80 + 100 + 120 = 300 tokens)
+  const agInsuf = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-order-indep-insuf-'));
+  const cliInsuf = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-order-indep-insuf-cli-'));
+  try {
+    writeTranscript120(agInsuf);
+    recordModelCalls([syn120], { agDir: agInsuf });
+    recordModelCalls([real80, real100], { agDir: agInsuf });
+
+    const calls = loadPricingLedger(agInsuf).calls || {};
+    assert.deepEqual(Object.keys(calls).sort(), [`${cid}#5`, 'resp_100', 'resp_80']);
+    const scan = await collectTokenHistoryAsync({ force: true, agDir: agInsuf, agCliDir: cliInsuf, userStatus: mockUserStatus });
+    assert.equal(scan.costEstimate.pricedRequestsCount, 3);
+    assert.equal(scan.costEstimate.pricedTokens, 300);
+    assert.equal(scan.costEstimate.unpricedTokens, 0);
+  } finally {
+    fs.rmSync(agInsuf, { recursive: true, force: true });
+    fs.rmSync(cliInsuf, { recursive: true, force: true });
+  }
+});
+
+test('production model-less transcript.jsonl with 120 tokens never overwrites completed 100-token RPC record at same step (220 priced tokens after resp_120 arrives)', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger } = require('./meter-collector');
+
+  const nowIso = new Date().toISOString();
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-prod-modelless-guard-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-prod-modelless-cli-'));
+
+  try {
+    const cid = '99999999-aaaa-4444-8888-eeeeeeeeeeee';
+    const resp100 = parseGeneratorCall({
+      created_at: nowIso,
+      stepIndices: [5],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 60, cacheReadTokens: 20, outputTokens: 20, responseId: 'resp_100' }
+      }
+    }, cid, 'desktop');
+    const resp120 = parseGeneratorCall({
+      created_at: nowIso,
+      stepIndices: [5],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 70, cacheReadTokens: 20, outputTokens: 30, responseId: 'resp_120' }
+      }
+    }, cid, 'desktop');
+
+    // 1) RPC 先写入已完成的 resp_100 (100 tokens, step 5)
+    recordModelCalls([resp100], { agDir });
+
+    // 2) 生产格式无 model 的 transcript.jsonl 在 step_index: 5 处有一条已完成 120-token 记录
+    const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 5,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: nowIso,
+        input_tokens: 70,
+        cache_read_tokens: 20,
+        output_tokens: 30
+      }) + '\n',
+      'utf8'
+    );
+
+    const scanBefore120 = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    const midCalls = loadPricingLedger(agDir).calls || {};
+    assert.deepEqual(Object.keys(midCalls), ['resp_100']);
+    assert.equal(midCalls.resp_100.totalTokens, 100, 'completed resp_100 must NOT be overwritten to 120 by model-less transcript');
+    assert.equal(scanBefore120.costEstimate.pricedRequestsCount, 1);
+    assert.equal(scanBefore120.costEstimate.pricedTokens, 100);
+    assert.equal(scanBefore120.costEstimate.unpricedRequestsCount, 1);
+    assert.equal(scanBefore120.costEstimate.unpricedTokens, 120);
+
+    // 3) 随后同步骤第二条 RPC 调用 resp_120 (120 tokens, step 5) 到达并重扫 -> 精确得到 220 已计价 tokens (绝非 240)
+    recordModelCalls([resp120], { agDir });
+    const scanAfter120 = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    const finalCalls = loadPricingLedger(agDir).calls || {};
+    assert.deepEqual(Object.keys(finalCalls).sort(), ['resp_100', 'resp_120']);
+    assert.equal(finalCalls.resp_100.totalTokens, 100);
+    assert.equal(finalCalls.resp_120.totalTokens, 120);
+    assert.equal(scanAfter120.costEstimate.pricedRequestsCount, 2);
+    assert.equal(scanAfter120.costEstimate.pricedTokens, 220);
+    assert.equal(scanAfter120.costEstimate.unpricedRequestsCount, 0);
+    assert.equal(scanAfter120.costEstimate.unpricedTokens, 0);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+
+test('completed zero-output (outputTokens=0, isEstimated=true) RPC call is never cross-key overwritten by 120-token transcript, while same-callId revision updates normally', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger } = require('./meter-collector');
+
+  const nowIso = new Date().toISOString();
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-zero-out-guard-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-zero-out-cli-'));
+
+  try {
+    const cid = 'abababab-1234-4444-8888-cdcdcdcdcdcd';
+
+    // 1) parseGeneratorCall 对 outputTokens: 0 的已完成调用设置 status: 'final', isEstimated: true
+    const callZeroOut = parseGeneratorCall({
+      created_at: nowIso,
+      status: 'final',
+      stepIndices: [5],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 0, responseId: 'resp_zero_out' }
+      }
+    }, cid, 'desktop');
+    assert.equal(callZeroOut.status, 'final');
+    assert.equal(callZeroOut.isEstimated, true);
+    assert.equal(callZeroOut.totalTokens, 100);
+
+    recordModelCalls([callZeroOut], { agDir });
+
+    // 2) 扫描同步骤 120-token 无模型 transcript.jsonl -> resp_zero_out 保持 100 tokens（100 已计价 + 120 未计价 = 220）
+    const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 5,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: nowIso,
+        input_tokens: 90,
+        cache_read_tokens: 0,
+        output_tokens: 30
+      }) + '\n',
+      'utf8'
+    );
+
+    const scanMid = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    const midCalls = loadPricingLedger(agDir).calls || {};
+    assert.deepEqual(Object.keys(midCalls), ['resp_zero_out']);
+    assert.equal(midCalls.resp_zero_out.totalTokens, 100, 'completed zero-output real call must NOT be cross-key overwritten to 120');
+    assert.equal(scanMid.costEstimate.pricedRequestsCount, 1);
+    assert.equal(scanMid.costEstimate.pricedTokens, 100);
+    assert.equal(scanMid.costEstimate.unpricedRequestsCount, 1);
+    assert.equal(scanMid.costEstimate.unpricedTokens, 120);
+
+    // 3) 随后同步骤第二条 RPC 调用 resp_120 (90 + 30 = 120 tokens) 到达并重扫 -> 2 条已计价记录共 220 tokens (绝非 240)
+    const call120 = parseGeneratorCall({
+      created_at: nowIso,
+      status: 'final',
+      stepIndices: [5],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 90, cacheReadTokens: 0, outputTokens: 30, responseId: 'resp_120' }
+      }
+    }, cid, 'desktop');
+    recordModelCalls([call120], { agDir });
+
+    const scanAfter120 = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    const callsAfter120 = loadPricingLedger(agDir).calls || {};
+    assert.deepEqual(Object.keys(callsAfter120).sort(), ['resp_120', 'resp_zero_out']);
+    assert.equal(callsAfter120.resp_zero_out.totalTokens, 100);
+    assert.equal(callsAfter120.resp_120.totalTokens, 120);
+    assert.equal(scanAfter120.costEstimate.pricedRequestsCount, 2);
+    assert.equal(scanAfter120.costEstimate.pricedTokens, 220);
+    assert.equal(scanAfter120.costEstimate.unpricedRequestsCount, 0);
+    assert.equal(scanAfter120.costEstimate.unpricedTokens, 0);
+
+    // 4) 同一显式 callId ('resp_zero_out') 后续校准用量 (100 + 25 = 125 tokens) 依然正常原地修订为 125 tokens
+    const callZeroOutRevised = parseGeneratorCall({
+      created_at: nowIso,
+      status: 'final',
+      stepIndices: [5],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 100, cacheReadTokens: 0, outputTokens: 25, responseId: 'resp_zero_out' }
+      }
+    }, cid, 'desktop');
+    recordModelCalls([callZeroOutRevised], { agDir });
+    const revised = loadPricingLedger(agDir).calls.resp_zero_out;
+    assert.equal(revised.outputTokens, 25);
+    assert.equal(revised.totalTokens, 125);
+    assert.equal(revised.isEstimated, false);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+
+test('[P2] time-source provenance calibrates provisional RPC dates & costs on disk (backward across rate tier, same-rate cross-month, and forward UTC->local day)', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { recordModelCalls, loadPricingLedger, formatLocalDateKey } = require('./meter-collector');
+
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-date-provenance-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-date-provenance-cli-'));
+  const prevWindow = globalThis.window;
+
+  try {
+    // (1) 跨调价日向前回拨：在 2026-12-02 打开 2026-11-25 的历史会话，RPC 无时间先打上临时 12-02 ($1.22)，扫描对齐 transcript 后必须将 11-25 与 $0.61 一并落盘
+    const cidRate = '12121212-2525-4444-8888-aaaaaaaaaaaa';
+    const prevDateNow = Date.now;
+    globalThis.window = {};
+    Date.now = () => new Date(2026, 11, 2, 14, 0, 0).getTime(); // 本地 2026-12-02 14:00:00
+    let rpcProvisionalDec;
+    try {
+      rpcProvisionalDec = parseGeneratorCall({
+        stepIndices: [3],
+        chatModel: {
+          modelDisplayName: 'Gemini 4 Carbon (High)',
+          responseModel: 'gemini-4-carbon',
+          usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_nov25_opened_dec2' }
+        }
+      }, cidRate, 'desktop');
+    } finally {
+      Date.now = prevDateNow;
+      if (prevWindow === undefined) delete globalThis.window;
+      else globalThis.window = prevWindow;
+    }
+
+    assert.equal(rpcProvisionalDec.date, '2026-12-02');
+    assert.equal(rpcProvisionalDec.dateSource, 'provisional');
+    assert.equal(rpcProvisionalDec.dateIsProvisional, true);
+    assert.equal(rpcProvisionalDec.created_at, null);
+    assert.equal(rpcProvisionalDec.costUSD, 1.22);
+
+    recordModelCalls([rpcProvisionalDec], { agDir });
+    assert.equal(loadPricingLedger(agDir).calls.resp_nov25_opened_dec2.costUSD, 1.22);
+
+    const logDirRate = path.join(agDir, 'brain', cidRate, '.system_generated', 'logs');
+    fs.mkdirSync(logDirRate, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDirRate, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-25T10:00:00Z',
+        input_tokens: 250000,
+        cache_read_tokens: 100000,
+        output_tokens: 10000
+      }) + '\n',
+      'utf8'
+    );
+
+    // (2) 同费率跨月修正：2026-10-28 的 Claude Opus 5.5 会话在 2026-11-12 打开，费率相同 ($1.32) 但日期跨月，对齐后磁盘日期必须修正为 2026-10-28
+    const cidMonth = '10101010-2828-4444-8888-bbbbbbbbbbbb';
+    const rpcProvisionalNov = parseGeneratorCall({
+      date: '2026-11-12',
+      dateIsProvisional: true,
+      stepIndices: [1],
+      chatModel: {
+        modelDisplayName: 'Claude Opus 5.5 (High)',
+        usage: { inputTokens: 300000, cacheReadTokens: 100000, outputTokens: 5000, responseId: 'resp_oct28_opened_nov12' }
+      }
+    }, cidMonth, 'desktop');
+    assert.equal(rpcProvisionalNov.date, '2026-11-12');
+    assert.equal(rpcProvisionalNov.costUSD, 1.32);
+    recordModelCalls([rpcProvisionalNov], { agDir });
+
+    const logDirMonth = path.join(agDir, 'brain', cidMonth, '.system_generated', 'logs');
+    fs.mkdirSync(logDirMonth, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDirMonth, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-10-28T09:00:00Z',
+        input_tokens: 300000,
+        cache_read_tokens: 100000,
+        output_tokens: 5000
+      }) + '\n',
+      'utf8'
+    );
+
+    // (3) 向后跨日修正：临时或 UTC 切片日期为 2026-11-30 ($0.61)，真实本地时间为 2026-12-01 01:30 ($1.22)，必须向后跨日修正日期与费用并落盘
+    const cidForward = '11301201-0130-4444-8888-cccccccccccc';
+    const localDec1Early = new Date(2026, 11, 1, 1, 30, 0); // 本地时间 2026-12-01 01:30:00（在 UTC+8 下 ISO 为 2026-11-30T17:30:00.000Z）
+    const dec1Iso = localDec1Early.toISOString();
+    assert.equal(formatLocalDateKey(localDec1Early), '2026-12-01');
+
+    const directParsedForward = parseGeneratorCall({
+      created_at: dec1Iso,
+      stepIndices: [2],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_forward_direct' }
+      }
+    }, cidForward, 'desktop');
+    assert.equal(directParsedForward.date, '2026-12-01');
+    assert.equal(directParsedForward.costUSD, 1.22);
+
+    const rpcProvisionalNov30 = parseGeneratorCall({
+      date: '2026-11-30',
+      dateIsProvisional: true,
+      stepIndices: [4],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_forward_nov30_to_dec1' }
+      }
+    }, cidForward, 'desktop');
+    assert.equal(rpcProvisionalNov30.date, '2026-11-30');
+    assert.equal(rpcProvisionalNov30.costUSD, 0.61);
+    recordModelCalls([rpcProvisionalNov30], { agDir });
+
+    const logDirForward = path.join(agDir, 'brain', cidForward, '.system_generated', 'logs');
+    fs.mkdirSync(logDirForward, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDirForward, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 4,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: dec1Iso,
+        input_tokens: 250000,
+        cache_read_tokens: 100000,
+        output_tokens: 10000
+      }) + '\n',
+      'utf8'
+    );
+
+    const scanRes = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    // 合计已计价：0.61 (11-25) + 1.32 (10-28) + 1.22 (12-01) = 3.15
+    assert.equal(scanRes.costEstimate.pricedCostUSD, 3.15);
+    assert.equal(scanRes.costEstimate.unpricedTokens, 0);
+
+    // 核验磁盘持久化账本：三类日期与重算费用必须全部落盘，且解除 provisional 标记
+    const diskLedger = JSON.parse(fs.readFileSync(path.join(agDir, 'pricing_ledger_v1.json'), 'utf8'));
+    assert.equal(diskLedger.calls.resp_nov25_opened_dec2.date, '2026-11-25');
+    assert.equal(diskLedger.calls.resp_nov25_opened_dec2.costUSD, 0.61);
+    assert.equal(diskLedger.calls.resp_nov25_opened_dec2.dateIsProvisional, false);
+
+    assert.equal(diskLedger.calls.resp_oct28_opened_nov12.date, '2026-10-28');
+    assert.equal(diskLedger.calls.resp_oct28_opened_nov12.costUSD, 1.32);
+    assert.equal(diskLedger.calls.resp_oct28_opened_nov12.dateIsProvisional, false);
+
+    assert.equal(diskLedger.calls.resp_forward_nov30_to_dec1.date, '2026-12-01');
+    assert.equal(diskLedger.calls.resp_forward_nov30_to_dec1.costUSD, 1.22);
+    assert.equal(diskLedger.calls.resp_forward_nov30_to_dec1.dateIsProvisional, false);
+
+    // 后续前端再次发送带临时日期 (2026-12-02, $1.22) 的同 callId 记录，绝不能回退覆盖已校准的真实历史日期与费用
+    const stalePollRes = recordModelCalls([rpcProvisionalDec], { agDir });
+    assert.equal(stalePollRes.ok, true);
+    assert.equal(stalePollRes.changed, false);
+    const afterStaleDisk = JSON.parse(fs.readFileSync(path.join(agDir, 'pricing_ledger_v1.json'), 'utf8'));
+    assert.equal(afterStaleDisk.calls.resp_nov25_opened_dec2.date, '2026-11-25');
+    assert.equal(afterStaleDisk.calls.resp_nov25_opened_dec2.costUSD, 0.61);
+
+    // 清理 10-28 的 transcript.jsonl（仅剩 v2 归档 + 账本）后重扫：2026-10-28 的 v2 归档被精确抵扣，零未计价残差泄漏
+    fs.rmSync(path.join(agDir, 'brain', cidMonth), { recursive: true, force: true });
+    const scanAfterCleanup = await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    assert.equal(scanAfterCleanup.costEstimate.pricedCostUSD, 3.15);
+    assert.equal(scanAfterCleanup.costEstimate.unpricedTokens, 0);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+
+test('[P2 & P3] MODEL_PLACEHOLDER_* cross-key dedup, same-callId GPT-OSS 120B enrichment, and resolveModelQuota two-path matching', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { resolveModelQuota } = require('./meter-core');
+  const { recordModelCalls, loadPricingLedger } = require('./meter-collector');
+
+  const mockUserStatus = { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } };
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-placeholder-fix-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-placeholder-cli-'));
+
+  try {
+    const cid = '55555555-6666-4444-8888-999999999999';
+
+    // 1) 跨键占位符消重：合成键 <cid>#2 含 MODEL_PLACEHOLDER_M437 (100 tok) 与真实 ID resp_carbon_2 (100 tok) 自动归并为单键；但不同用量 (100 vs 140) 的已完成真实记录仍保持跨键隔离守卫
+    const synPlaceholder = {
+      callId: `${cid}#2`,
+      source: 'desktop',
+      cascadeId: cid,
+      stepIndex: 2,
+      model: 'MODEL_PLACEHOLDER_M437',
+      modelKey: null,
+      inputTokens: 70,
+      cacheTokens: 10,
+      outputTokens: 20,
+      totalTokens: 100,
+      status: 'final',
+      isPriced: false,
+      costUSD: 0,
+      date: '2026-11-12'
+    };
+    const realCarbon = parseGeneratorCall({
+      date: '2026-11-12',
+      stepIndices: [2],
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (Medium)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 70, cacheReadTokens: 10, outputTokens: 20, responseId: 'resp_carbon_2' }
+      }
+    }, cid, 'desktop');
+
+    recordModelCalls([synPlaceholder], { agDir });
+    recordModelCalls([realCarbon], { agDir });
+    const afterCrossMerge = loadPricingLedger(agDir).calls;
+    assert.deepEqual(Object.keys(afterCrossMerge), ['resp_carbon_2']);
+    assert.equal(afterCrossMerge.resp_carbon_2.model, 'Gemini 4 Carbon (Medium)');
+    assert.equal(afterCrossMerge.resp_carbon_2.isPriced, true);
+
+    // 验证跨键严格用量守卫未松动：已完成非零真实记录 (100 tok) 遇到 140-tok 占位符合成键时绝不跨键篡改用量，双键独立保留
+    const synDiffUsage = {
+      ...synPlaceholder,
+      callId: `${cid}#2`,
+      inputTokens: 100,
+      cacheTokens: 10,
+      outputTokens: 30,
+      totalTokens: 140
+    };
+    recordModelCalls([synDiffUsage], { agDir });
+    const guardedCalls = loadPricingLedger(agDir).calls;
+    assert.deepEqual(Object.keys(guardedCalls).sort(), [`${cid}#2`, 'resp_carbon_2']);
+    assert.equal(guardedCalls.resp_carbon_2.totalTokens, 100);
+    assert.equal(guardedCalls[`${cid}#2`].totalTokens, 140);
+
+    // 2) 同 callId 补上无公开费率真实模型 (MODEL_PLACEHOLDER_M999 -> GPT-OSS 120B (Medium))：recordModelCalls 与 collectTokenHistoryAsync 均须更新落盘且防逆向回退
+    const phGpt = parseGeneratorCall({
+      date: '2026-11-12',
+      stepIndices: [6],
+      chatModel: {
+        model: 'MODEL_PLACEHOLDER_M999',
+        usage: { inputTokens: 800, cacheReadTokens: 0, outputTokens: 200, responseId: 'resp_gptoss_rpc' }
+      }
+    }, cid, 'desktop');
+    const resolvedGpt = parseGeneratorCall({
+      date: '2026-11-12',
+      stepIndices: [6],
+      chatModel: {
+        modelDisplayName: 'GPT-OSS 120B (Medium)',
+        usage: { inputTokens: 800, cacheReadTokens: 0, outputTokens: 200, responseId: 'resp_gptoss_rpc' }
+      }
+    }, cid, 'desktop');
+
+    recordModelCalls([phGpt], { agDir });
+    assert.equal(loadPricingLedger(agDir).calls.resp_gptoss_rpc.model, 'MODEL_PLACEHOLDER_M999');
+
+    const updGptRes = recordModelCalls([resolvedGpt], { agDir });
+    assert.equal(updGptRes.ok, true);
+    assert.equal(updGptRes.changed, true);
+    const diskAfterRpcGpt = JSON.parse(fs.readFileSync(path.join(agDir, 'pricing_ledger_v1.json'), 'utf8'));
+    assert.equal(diskAfterRpcGpt.calls.resp_gptoss_rpc.model, 'GPT-OSS 120B (Medium)');
+    assert.equal(diskAfterRpcGpt.calls.resp_gptoss_rpc.isPriced, false);
+
+    // 逆向迟到占位符不得把 GPT-OSS 120B 覆盖回 MODEL_PLACEHOLDER_M999
+    const rollbackRes = recordModelCalls([phGpt], { agDir });
+    assert.equal(rollbackRes.changed, false);
+    assert.equal(loadPricingLedger(agDir).calls.resp_gptoss_rpc.model, 'GPT-OSS 120B (Medium)');
+
+    // 验证扫描路径 applyTranscriptMatch (modelEnriched) 对同一 callId 同样完成 MODEL_PLACEHOLDER -> GPT-OSS 120B 落盘
+    const phScanSeed = {
+      ...phGpt,
+      callId: 'resp_gptoss_scan',
+      stepIndex: 7
+    };
+    recordModelCalls([phScanSeed], { agDir });
+    const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(logDir, 'transcript.jsonl'),
+      JSON.stringify({
+        step_index: 7,
+        callId: 'resp_gptoss_scan',
+        created_at: '2026-11-12T06:00:00Z',
+        model: 'GPT-OSS 120B (Medium)',
+        input_tokens: 800,
+        cache_read_tokens: 0,
+        output_tokens: 200
+      }) + '\n',
+      'utf8'
+    );
+    await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: mockUserStatus });
+    const diskAfterScanGpt = JSON.parse(fs.readFileSync(path.join(agDir, 'pricing_ledger_v1.json'), 'utf8'));
+    assert.equal(diskAfterScanGpt.calls.resp_gptoss_scan.model, 'GPT-OSS 120B (Medium)');
+
+    // 3) P3 resolveModelQuota 双路径核验：modelOrAlias.model 精确匹配 + label 模型家族匹配 + Argon 5h 池命名
+    const liveClientConfigs = [
+      {
+        label: 'Gemini 4 Carbon (Medium)',
+        modelOrAlias: { model: 'MODEL_PLACEHOLDER_M437' },
+        quotaInfo: { remainingFraction: 0.82, resetTime: '2026-11-12T12:00:00Z' }
+      },
+      {
+        label: 'Gemini 4 Argon (High)',
+        modelOrAlias: { model: 'MODEL_PLACEHOLDER_M18' },
+        quotaInfo: { remainingFraction: 0.82, resetTime: '2026-11-12T12:00:00Z' }
+      }
+    ];
+    const exactPlaceholderQuota = resolveModelQuota('MODEL_PLACEHOLDER_M437', liveClientConfigs);
+    assert.ok(exactPlaceholderQuota);
+    assert.equal(exactPlaceholderQuota.modelId, 'MODEL_PLACEHOLDER_M437');
+    assert.equal(exactPlaceholderQuota.label, 'Gemini 4 Carbon (Medium)');
+    assert.equal(exactPlaceholderQuota.remainingFraction, 0.82);
+
+    const familyCarbonQuota = resolveModelQuota('gemini-4-carbon', liveClientConfigs);
+    assert.ok(familyCarbonQuota);
+    assert.equal(familyCarbonQuota.poolKey, 'gemini-4-carbon');
+    assert.equal(familyCarbonQuota.poolName, 'Gemini 4 Carbon 配额池');
+    assert.equal(familyCarbonQuota.remainingFraction, 0.82);
+
+    const familyArgonQuota = resolveModelQuota('gemini-4-argon', liveClientConfigs);
+    assert.ok(familyArgonQuota);
+    assert.equal(familyArgonQuota.poolName, 'Gemini 4 Argon 配额池（周限额）');
+
+    // 4) P3 通用短标签（如 label: "High" / "Medium"）不得遮住可识别的 modelId 或 modelOrAlias.model
+    const genericLabelConfigs = [
+      {
+        label: 'High',
+        modelId: 'gemini-4-argon-high',
+        quotaInfo: { remainingFraction: 0.75, resetTime: '2026-11-12T13:00:00Z' }
+      },
+      {
+        label: 'Medium',
+        modelOrAlias: { model: 'claude-sonnet-5-5-medium' },
+        quotaInfo: { remainingFraction: 0.6, resetTime: '2026-11-12T14:00:00Z' }
+      }
+    ];
+    const exactGenericLabel = resolveModelQuota('gemini-4-argon-high', genericLabelConfigs);
+    assert.ok(exactGenericLabel);
+    assert.equal(exactGenericLabel.remainingFraction, 0.75);
+
+    const familyFromModelId = resolveModelQuota('gemini-4-argon', genericLabelConfigs);
+    assert.ok(familyFromModelId, '通用 label:"High" 未命中家族时必须继续回退匹配 modelId');
+    assert.equal(familyFromModelId.poolKey, 'gemini-4-argon');
+    assert.equal(familyFromModelId.poolName, 'Gemini 4 Argon 配额池（周限额）');
+    assert.equal(familyFromModelId.remainingFraction, 0.75);
+
+    const familyFromAliasModel = resolveModelQuota('claude-sonnet-5-5', genericLabelConfigs);
+    assert.ok(familyFromAliasModel, '通用 label:"Medium" 未命中家族时必须继续回退匹配 modelOrAlias.model');
+    assert.equal(familyFromAliasModel.poolKey, 'claude-sonnet-5-5');
+    assert.equal(familyFromAliasModel.poolName, 'Claude / GPT-OSS 第三方共享池');
+    assert.equal(familyFromAliasModel.remainingFraction, 0.6);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+
+
+test('Codex 审阅回归：resolveModelQuota 非空占位 modelId 不遮蔽 modelOrAlias.model、Claude 5.5 子补丁号拒识、同等级权威时间双向修正与 Pass 2 双边唯一性', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { resolveModelQuota } = require('./meter-core');
+  const { loadPricingLedger } = require('./meter-collector');
+
+  // 1) resolveModelQuota：当 modelId 非空（如占位符）且同池前序项存在时，仍必须优先精确命中 modelOrAlias.model
+  const aliasShadowConfigs = [
+    {
+      modelId: 'MODEL_PLACEHOLDER_M401',
+      modelOrAlias: { model: 'claude-opus-5-5-standard' },
+      label: 'Claude Opus 5.5',
+      quotaInfo: { remainingFraction: 0.9, resetTime: '2026-11-13T10:00:00Z' }
+    },
+    {
+      modelId: 'MODEL_PLACEHOLDER_M437',
+      modelOrAlias: { model: 'claude-opus-5-5-thinking' },
+      label: 'Claude Opus 5.5 (Thinking)',
+      quotaInfo: { remainingFraction: 0.1, resetTime: '2026-11-13T11:00:00Z' }
+    }
+  ];
+  const exactAliasQuota = resolveModelQuota('claude-opus-5-5-thinking', aliasShadowConfigs);
+  assert.ok(exactAliasQuota);
+  assert.equal(exactAliasQuota.remainingFraction, 0.1, '必须精确命中第二项 modelOrAlias.model 而非退回池级首项');
+  assert.equal(exactAliasQuota.label, 'Claude Opus 5.5 (Thinking)');
+
+  // 2) normalizeModelId：拒绝 5.5.1 / 5-5-1 等独立补丁子版本，同时兼容 8 位日期后缀与 Thinking/High 标签
+  assert.equal(normalizeModelId('claude-opus-5.5.1'), null);
+  assert.equal(normalizeModelId('claude-opus-5-5-1'), null);
+  assert.equal(normalizeModelId('claude-sonnet-5.5.2'), null);
+  assert.equal(normalizeModelId('Claude 5.5.1 Opus'), null);
+  assert.equal(normalizeModelId('claude-opus-5-5-20261101'), 'claude-opus-5-5');
+  assert.equal(normalizeModelId('claude-sonnet-5-5-20261101'), 'claude-sonnet-5-5');
+  assert.equal(normalizeModelId('Claude Opus 5.5 (Thinking)'), 'claude-opus-5-5');
+
+  // 3) recordModelCalls 同等级权威时间双向修订（基于显式修订依据）、同用量迟到旧快照防回滚、无版本冲突稳定策略与 (tot↑, out↓) 交叉快照一致性
+  const revDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-same-rank-date-rev-'));
+  try {
+    const cid = 'cccccccc-1111-4444-8888-222222222222';
+    const baseRow = {
+      stepIndices: [3],
+      status: 'final',
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_same_rank_rev' }
+      }
+    };
+    const initialUnversioned = parseGeneratorCall(baseRow, cid, 'desktop');
+    assert.equal(initialUnversioned.sourceRevision, undefined);
+    const rSeed = recordModelCalls([initialUnversioned], { agDir: revDir });
+    assert.equal(rSeed.ok, true);
+    assert.equal(rSeed.changed, true);
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.date, '2026-11-12');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.costUSD, 0.61);
+
+    // 3a) 正向修正：2026-11-12 -> 2026-12-01（携带显式 sourceRevision: 2，即使未同步重算 date 字段也必须生效）
+    const rForward = recordModelCalls([{
+      ...parseGeneratorCall({ ...baseRow, sourceRevision: 2 }, cid, 'desktop'),
+      date: '2026-11-12',
+      created_at: '2026-12-01T10:00:00Z'
+    }], { agDir: revDir });
+    assert.equal(rForward.ok, true);
+    assert.equal(rForward.changed, true, '带显式新修订号的同等级 created_at 正向修正必须落盘');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.date, '2026-12-01');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.costUSD, 1.22);
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.sourceRevision, 2);
+
+    // 3b) 同用量迟到的初始无版本快照与 sourceRevision: 1 旧快照（及重复重放）严禁把已修正的 12-01 ($1.22) 回滚回 11-12 ($0.61)
+    const lateInitialRes1 = recordModelCalls([initialUnversioned], { agDir: revDir });
+    assert.equal(lateInitialRes1.ok, true);
+    assert.equal(lateInitialRes1.changed, false, '同用量迟到的无版本初始快照不得回滚已修正日期');
+    const lateInitialRes2 = recordModelCalls([initialUnversioned], { agDir: revDir });
+    assert.equal(lateInitialRes2.changed, false, '重复到达的同用量旧快照必须保持幂等无变更');
+    const lateRev1Res = recordModelCalls([parseGeneratorCall({
+      ...baseRow,
+      sourceRevision: 1,
+      created_at: '2026-11-12T10:00:00Z'
+    }, cid, 'desktop')], { agDir: revDir });
+    assert.equal(lateRev1Res.changed, false, '同用量较低修订号快照不得回滚已修正日期');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.date, '2026-12-01');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.costUSD, 1.22);
+
+    // 3c) 逆向修正：2026-12-01 -> 2026-11-20（更高 sourceRevision: 3 / updated_at 支持双向日期校准，不以 created_at 本身判先后）
+    const rBackward = recordModelCalls([parseGeneratorCall({
+      ...baseRow,
+      sourceRevision: 3,
+      created_at: '2026-11-20T10:00:00Z'
+    }, cid, 'desktop')], { agDir: revDir });
+    assert.equal(rBackward.ok, true);
+    assert.equal(rBackward.changed, true, '带更高修订号的同等级 created_at 逆向修正必须落盘并重算费率');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.date, '2026-11-20');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.costUSD, 0.61);
+
+    // 迟到的 rev=2 (12-01) 与重复包不得将 11-20 ($0.61) 反弹回 12-01 ($1.22)
+    const lateRev2A = recordModelCalls([parseGeneratorCall({
+      ...baseRow,
+      sourceRevision: 2,
+      created_at: '2026-12-01T10:00:00Z'
+    }, cid, 'desktop')], { agDir: revDir });
+    const lateRev2B = recordModelCalls([parseGeneratorCall({
+      ...baseRow,
+      sourceRevision: 2,
+      created_at: '2026-12-01T10:00:00Z'
+    }, cid, 'desktop')], { agDir: revDir });
+    assert.equal(lateRev2A.changed, false);
+    assert.equal(lateRev2B.changed, false);
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.date, '2026-11-20');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.costUSD, 0.61);
+
+    // 3d) 乱序迟到的残缺低用量快照即使带新日期亦不得篡改已确认的权威日期
+    const rStaleRollback = recordModelCalls([parseGeneratorCall({
+      ...baseRow,
+      created_at: '2026-12-05T10:00:00Z',
+      chatModel: {
+        ...baseRow.chatModel,
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 2000, responseId: 'resp_same_rank_rev' }
+      }
+    }, cid, 'desktop')], { agDir: revDir });
+    assert.equal(rStaleRollback.changed, false, '用量倒退的乱序旧包不得改写同等级权威日期');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.date, '2026-11-20');
+    assert.equal(loadPricingLedger(revDir).calls.resp_same_rank_rev.costUSD, 0.61);
+
+    // 3e) 无修订依据且同用量的冲突策略：保留首个已入账权威日期，交替输入两版无版本数据零震荡
+    const unvNov = parseGeneratorCall({
+      ...baseRow,
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        ...baseRow.chatModel,
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_unversioned_tie' }
+      }
+    }, cid, 'desktop');
+    const unvDec = parseGeneratorCall({
+      ...baseRow,
+      created_at: '2026-12-01T10:00:00Z',
+      chatModel: {
+        ...baseRow.chatModel,
+        usage: { inputTokens: 250000, cacheReadTokens: 100000, outputTokens: 10000, responseId: 'resp_unversioned_tie' }
+      }
+    }, cid, 'desktop');
+    assert.equal(recordModelCalls([unvNov], { agDir: revDir }).changed, true);
+    assert.equal(recordModelCalls([unvDec], { agDir: revDir }).changed, false);
+    assert.equal(recordModelCalls([unvNov], { agDir: revDir }).changed, false);
+    assert.equal(recordModelCalls([unvDec], { agDir: revDir }).changed, false);
+    assert.equal(loadPricingLedger(revDir).calls.resp_unversioned_tie.date, '2026-11-12');
+    assert.equal(loadPricingLedger(revDir).calls.resp_unversioned_tie.costUSD, 0.61);
+
+    // 3f) “总量增加、输出量下降”交叉变化用例：input=100k,output=20k,tot=120k,11-12 ($0.40) -> input=130k,output=10k,tot=140k,12-01 ($0.72)
+    const crossInitial = parseGeneratorCall({
+      stepIndices: [5],
+      status: 'final',
+      created_at: '2026-11-12T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 100000, cacheReadTokens: 0, outputTokens: 20000, responseId: 'resp_tot_up_out_down' }
+      }
+    }, cid, 'desktop');
+    const crossProgressed = parseGeneratorCall({
+      stepIndices: [5],
+      status: 'final',
+      created_at: '2026-12-01T10:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Carbon (High)',
+        responseModel: 'gemini-4-carbon',
+        usage: { inputTokens: 130000, cacheReadTokens: 0, outputTokens: 10000, responseId: 'resp_tot_up_out_down' }
+      }
+    }, cid, 'desktop');
+    assert.equal(recordModelCalls([crossInitial], { agDir: revDir }).changed, true);
+    assert.equal(loadPricingLedger(revDir).calls.resp_tot_up_out_down.totalTokens, 120000);
+    assert.equal(loadPricingLedger(revDir).calls.resp_tot_up_out_down.costUSD, 0.4);
+
+    const crossUpdRes = recordModelCalls([crossProgressed], { agDir: revDir });
+    assert.equal(crossUpdRes.ok, true);
+    assert.equal(crossUpdRes.changed, true, '总量增长而输出下降的新快照必须被后端接收入账');
+    const crossSaved = loadPricingLedger(revDir).calls.resp_tot_up_out_down;
+    assert.equal(crossSaved.inputTokens, 130000);
+    assert.equal(crossSaved.outputTokens, 10000);
+    assert.equal(crossSaved.totalTokens, 140000);
+    assert.equal(crossSaved.date, '2026-12-01');
+    assert.equal(crossSaved.costUSD, 0.72);
+
+    // 迟到的原快照 (tot=120k, out=20k) 属于总量倒退，必须被拒绝
+    const crossReverseRes = recordModelCalls([crossInitial], { agDir: revDir });
+    assert.equal(crossReverseRes.changed, false);
+    assert.equal(loadPricingLedger(revDir).calls.resp_tot_up_out_down.totalTokens, 140000);
+    assert.equal(loadPricingLedger(revDir).calls.resp_tot_up_out_down.outputTokens, 10000);
+    assert.equal(loadPricingLedger(revDir).calls.resp_tot_up_out_down.date, '2026-12-01');
+  } finally {
+    fs.rmSync(revDir, { recursive: true, force: true });
+  }
+
+  // 4) Pass 2 历史无 stepIndex 用量指纹对齐：双边唯一性门禁与遍历顺序无关性验证
+  const runPass2OrderCase = async (reverseInsertionOrder) => {
+    const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-pass2-uniq-'));
+    const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-pass2-uniq-cli-'));
+    try {
+      const cid = 'dddddddd-2222-4444-8888-333333333333';
+      const entryNov = {
+        callId: 'resp_legacy_nov',
+        source: 'desktop',
+        cascadeId: cid,
+        stepIndex: null,
+        model: 'Gemini 4 Carbon (High)',
+        modelKey: 'gemini-4-carbon',
+        inputTokens: 250000,
+        cacheTokens: 100000,
+        cacheReadTokens: 100000,
+        outputTokens: 10000,
+        totalTokens: 360000,
+        status: 'final',
+        isPriced: true,
+        costUSD: 0.61,
+        date: '2026-11-28',
+        dateSource: 'provisional',
+        dateIsProvisional: true
+      };
+      const entryDec = {
+        ...entryNov,
+        callId: 'resp_legacy_dec',
+        costUSD: 1.22,
+        date: '2026-12-02'
+      };
+      const ordered = reverseInsertionOrder ? [entryDec, entryNov] : [entryNov, entryDec];
+      recordModelCalls(ordered, { agDir });
+
+      // 日志中仅有 1 条同会话同用量 (250k/100k/10k) 的未匹配合成记录（日期 2026-12-01）：因账本侧存在 2 条候选，必须保持双边不匹配
+      const logDir = path.join(agDir, 'brain', cid, '.system_generated', 'logs');
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(logDir, 'transcript.jsonl'),
+        JSON.stringify({
+          step_index: 9,
+          created_at: '2026-12-01T08:00:00Z',
+          model: 'MODEL_PLACEHOLDER_M37',
+          input_tokens: 250000,
+          cache_read_tokens: 100000,
+          output_tokens: 10000
+        }) + '\n',
+        'utf8'
+      );
+
+      const hist = await collectTokenHistoryAsync({
+        force: true,
+        agDir,
+        agCliDir: cliDir,
+        userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } }
+      });
+      const persisted = loadPricingLedger(agDir).calls;
+      assert.equal(persisted.resp_legacy_nov.stepIndex, null, '歧义候选不得被贪心绑定 stepIndex');
+      assert.equal(persisted.resp_legacy_dec.stepIndex, null, '歧义候选不得被贪心绑定 stepIndex');
+      assert.equal(persisted.resp_legacy_nov.date, '2026-11-28');
+      assert.equal(persisted.resp_legacy_dec.date, '2026-12-02');
+      return hist.costEstimate.pricedCostUSD;
+    } finally {
+      fs.rmSync(agDir, { recursive: true, force: true });
+      fs.rmSync(cliDir, { recursive: true, force: true });
+    }
+  };
+
+  const costOrderA = await runPass2OrderCase(false);
+  const costOrderB = await runPass2OrderCase(true);
+  assert.equal(costOrderA, costOrderB, 'Pass 2 歧义场景下的计费总额必须与账本键遍历顺序严格无关');
+  assert.equal(costOrderA, 1.83);
+
+  // 4b) 对称歧义（1 条无 stepIndex 账本记录 vs 2 条同用量未匹配日志）不得匹配；不同模型同用量互不干扰可各自唯一匹配
+  {
+    const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-pass2-sym-'));
+    const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-pass2-sym-cli-'));
+    try {
+      const cidSym = 'eeeeeeee-3333-4444-8888-444444444444';
+      recordModelCalls([
+        {
+          callId: 'resp_one_ledger',
+          source: 'desktop',
+          cascadeId: cidSym,
+          stepIndex: null,
+          model: 'Gemini 4 Carbon (High)',
+          modelKey: 'gemini-4-carbon',
+          inputTokens: 100000,
+          cacheTokens: 0,
+          cacheReadTokens: 0,
+          outputTokens: 5000,
+          totalTokens: 105000,
+          status: 'final',
+          isPriced: true,
+          costUSD: 0.25,
+          date: '2026-11-28',
+          dateSource: 'provisional',
+          dateIsProvisional: true
+        }
+      ], { agDir });
+      const logDirSym = path.join(agDir, 'brain', cidSym, '.system_generated', 'logs');
+      fs.mkdirSync(logDirSym, { recursive: true });
+      fs.writeFileSync(
+        path.join(logDirSym, 'transcript.jsonl'),
+        [
+          JSON.stringify({ step_index: 3, created_at: '2026-11-28T08:00:00Z', model: 'MODEL_PLACEHOLDER_M37', input_tokens: 100000, cache_read_tokens: 0, output_tokens: 5000 }),
+          JSON.stringify({ step_index: 6, created_at: '2026-12-01T08:00:00Z', model: 'MODEL_PLACEHOLDER_M37', input_tokens: 100000, cache_read_tokens: 0, output_tokens: 5000 })
+        ].join('\n') + '\n',
+        'utf8'
+      );
+      await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } } });
+      assert.equal(loadPricingLedger(agDir).calls.resp_one_ledger.stepIndex, null, '1 对 2 日志歧义时不得任选一条绑定');
+      assert.equal(loadPricingLedger(agDir).calls.resp_one_ledger.date, '2026-11-28');
+
+      // 不同家族模型即使同会话同用量，在兼容二分图上各自度数为 1，应各自精确完成 1-to-1 对齐
+      const cidDiffModel = 'ffffffff-4444-4444-8888-555555555555';
+      recordModelCalls([
+        {
+          callId: 'resp_diff_carbon',
+          source: 'desktop',
+          cascadeId: cidDiffModel,
+          stepIndex: null,
+          model: 'Gemini 4 Carbon (High)',
+          modelKey: 'gemini-4-carbon',
+          inputTokens: 120000,
+          cacheTokens: 0,
+          cacheReadTokens: 0,
+          outputTokens: 6000,
+          totalTokens: 126000,
+          status: 'final',
+          isPriced: true,
+          costUSD: 0.3,
+          date: '2026-11-28',
+          dateSource: 'provisional',
+          dateIsProvisional: true
+        },
+        {
+          callId: 'resp_diff_opus',
+          source: 'desktop',
+          cascadeId: cidDiffModel,
+          stepIndex: null,
+          model: 'Claude Opus 5.5 (Thinking)',
+          modelKey: 'claude-opus-5-5',
+          inputTokens: 120000,
+          cacheTokens: 0,
+          cacheReadTokens: 0,
+          outputTokens: 6000,
+          totalTokens: 126000,
+          status: 'final',
+          isPriced: true,
+          costUSD: 0.6,
+          date: '2026-11-28',
+          dateSource: 'provisional',
+          dateIsProvisional: true
+        }
+      ], { agDir });
+      const logDirDiff = path.join(agDir, 'brain', cidDiffModel, '.system_generated', 'logs');
+      fs.mkdirSync(logDirDiff, { recursive: true });
+      fs.writeFileSync(
+        path.join(logDirDiff, 'transcript.jsonl'),
+        [
+          JSON.stringify({ step_index: 4, created_at: '2026-12-01T08:00:00Z', model: 'gemini-4-carbon', input_tokens: 120000, cache_read_tokens: 0, output_tokens: 6000 }),
+          JSON.stringify({ step_index: 8, created_at: '2026-11-29T08:00:00Z', model: 'claude-opus-5-5', input_tokens: 120000, cache_read_tokens: 0, output_tokens: 6000 })
+        ].join('\n') + '\n',
+        'utf8'
+      );
+      await collectTokenHistoryAsync({ force: true, agDir, agCliDir: cliDir, userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } } });
+      assert.equal(loadPricingLedger(agDir).calls.resp_diff_carbon.stepIndex, 4);
+      assert.equal(loadPricingLedger(agDir).calls.resp_diff_carbon.date, '2026-12-01');
+      assert.equal(loadPricingLedger(agDir).calls.resp_diff_opus.stepIndex, 8);
+      assert.equal(loadPricingLedger(agDir).calls.resp_diff_opus.date, '2026-11-29');
+    } finally {
+      fs.rmSync(agDir, { recursive: true, force: true });
+      fs.rmSync(cliDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('Gemini 4 Hydrogen 四档模型识别、1M 统一单档计价、配额池解析与 Orchestrator 边界回归', async () => {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+  const { resolveModelQuota, calculateRequestApiCost } = require('./meter-core');
+  const { loadPricingLedger } = require('./meter-collector');
+
+  const multiPoolConfigs = [
+    {
+      modelId: 'MODEL_PLACEHOLDER_M501',
+      modelOrAlias: { model: 'gemini-4-hydrogen-xhigh' },
+      label: 'XHigh',
+      quotaInfo: { remainingFraction: 0.86, resetTime: '2026-11-13T06:54:16Z' }
+    },
+    {
+      modelId: 'MODEL_PLACEHOLDER_M37',
+      modelOrAlias: { model: 'gemini-4-carbon-high' },
+      label: 'Gemini 4 Carbon (High)',
+      quotaInfo: { remainingFraction: 0.86, resetTime: '2026-11-13T06:54:16Z' }
+    },
+    {
+      modelId: 'MODEL_PLACEHOLDER_M38',
+      modelOrAlias: { model: 'gemini-4-argon-high' },
+      label: 'Gemini 4 Argon (High)',
+      quotaInfo: { remainingFraction: 0.50, resetTime: '2026-11-13T06:54:16Z' }
+    }
+  ];
+
+  // 1) 线上 4 档 Hydrogen 模型 ID 与展示名（含新增 XHigh 思考档）识别及配额池家族回退归类
+  const hydrogenVariants = [
+    'gemini-4-hydrogen',
+    'gemini-4-hydrogen-low',
+    'gemini-4-hydrogen-medium',
+    'gemini-4-hydrogen-high',
+    'gemini-4-hydrogen-xhigh',
+    'Gemini 4 Hydrogen (Low)',
+    'Gemini 4 Hydrogen (Medium)',
+    'Gemini 4 Hydrogen (High)',
+    'Gemini 4 Hydrogen (XHigh)'
+  ];
+  for (const variant of hydrogenVariants) {
+    assert.equal(normalizeModelId(variant), 'gemini-4-hydrogen', `normalizeModelId 应识别 ${variant}`);
+    const q = resolveModelQuota(variant, multiPoolConfigs);
+    assert.ok(q, `resolveModelQuota 应匹配 ${variant}`);
+    assert.equal(q.poolKey, 'gemini-4-hydrogen', `poolKey 应归类 ${variant}`);
+    assert.equal(q.poolName, 'Gemini 4 Hydrogen / 3.8 Flash 共享池');
+    assert.equal(q.remainingFraction, 0.86);
+  }
+
+  // 2) Orchestrator 原始 ID 与边界：2.32.1 客户端已将裸 gemini-pro-orchestrator 归入 Argon，-carbon 归入 Carbon，未知后缀保持未计价
+  assert.equal(normalizeModelId('gemini-pro-orchestrator'), 'gemini-4-argon');
+  assert.equal(resolveModelQuota('gemini-pro-orchestrator', multiPoolConfigs).poolKey, 'gemini-4-argon');
+  assert.equal(normalizeModelId('Orchestrator (Carbon)'), 'gemini-4-carbon');
+  assert.equal(normalizeModelId('gemini-pro-orchestrator-argon'), 'gemini-4-argon');
+  assert.equal(resolveModelQuota('gemini-pro-orchestrator-argon', multiPoolConfigs).poolKey, 'gemini-4-argon');
+  assert.equal(resolveModelQuota('gemini-pro-orchestrator-argon', multiPoolConfigs).remainingFraction, 0.50);
+  assert.equal(normalizeModelId('Orchestrator (Argon)'), 'gemini-4-argon');
+  assert.equal(normalizeModelId('gemini-pro-orchestrator-xenon'), null, '未知 Orchestrator 变体不得误套 Argon/Carbon 费率');
+  assert.equal(resolveModelQuota('gemini-pro-orchestrator-xenon', multiPoolConfigs), null);
+
+  // 3) 1M 窗口统一单档费率（$1.50 / $7.50 / $0.075 per 1M）：超 200K 上下文及跨年均无阶梯跳涨
+  //    400k input ($0.60) + 200k cache ($0.015) + 20k output ($0.15) = $0.765
+  const costNov = calculateRequestApiCost({
+    modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+    inputTokens: 400000,
+    cacheReadTokens: 200000,
+    outputTokens: 20000,
+    thinkingTokens: 12000,
+    date: '2026-11-13'
+  });
+  assert.equal(costNov.isPriced, true);
+  assert.equal(costNov.modelKey, 'gemini-4-hydrogen');
+  assert.equal(costNov.costUSD, 0.765);
+
+  const costJan = calculateRequestApiCost({
+    model: 'gemini-4-hydrogen-high',
+    inputTokens: 400000,
+    cacheReadTokens: 200000,
+    outputTokens: 20000,
+    date: '2027-01-15'
+  });
+  assert.equal(costJan.isPriced, true);
+  assert.equal(costJan.costUSD, 0.765);
+
+  const refHydrogen = calculateReferenceModelCost({
+    inputTokens: 400000,
+    cacheTokens: 200000,
+    outputTokens: 20000,
+    totalTokens: 620000
+  }, 'gemini-4-hydrogen', { pricingDate: '2026-11-13', mode: 'all' });
+  assert.equal(refHydrogen.modelDisplayName, 'Gemini 4 Hydrogen');
+  assert.equal(refHydrogen.totalCostUSD, 0.765);
+
+  // 4) resolveModelQuota：非空占位 modelId 下优先精确命中对应档位的 modelOrAlias.model
+  const hydrogenTierConfigs = [
+    {
+      modelId: 'MODEL_PLACEHOLDER_M501',
+      modelOrAlias: { model: 'gemini-4-hydrogen-xhigh' },
+      label: 'Gemini 4 Hydrogen (XHigh)',
+      quotaInfo: { remainingFraction: 0.86, resetTime: '2026-11-13T06:54:16Z' }
+    },
+    {
+      modelId: 'MODEL_PLACEHOLDER_M502',
+      modelOrAlias: { model: 'gemini-4-hydrogen-low' },
+      label: 'Gemini 4 Hydrogen (Low)',
+      quotaInfo: { remainingFraction: 0.42, resetTime: '2026-11-13T06:54:16Z' }
+    }
+  ];
+  const exactLowQuota = resolveModelQuota('gemini-4-hydrogen-low', hydrogenTierConfigs);
+  assert.ok(exactLowQuota);
+  assert.equal(exactLowQuota.poolKey, 'gemini-4-hydrogen');
+  assert.equal(exactLowQuota.poolName, 'Gemini 4 Hydrogen / 3.8 Flash 共享池');
+  assert.equal(exactLowQuota.label, 'Gemini 4 Hydrogen (Low)');
+  assert.equal(exactLowQuota.remainingFraction, 0.42);
+
+  // 5) 历史账本兼容重算：旧版未收录时落盘的 isPriced=false Hydrogen 记录升级后自动识别重算
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-hydrogen-upgrade-'));
+  const cliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-hydrogen-upgrade-cli-'));
+  try {
+    fs.writeFileSync(
+      path.join(agDir, 'pricing_ledger_v1.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        calls: {
+          resp_h2_old: {
+            callId: 'resp_h2_old',
+            source: 'desktop',
+            cascadeId: '11111111-aaaa-4444-8888-bbbbbbbbbbbb',
+            stepIndex: 1,
+            model: 'Gemini 4 Hydrogen (XHigh)',
+            modelKey: null,
+            inputTokens: 400000,
+            cacheTokens: 200000,
+            cacheReadTokens: 200000,
+            outputTokens: 20000,
+            totalTokens: 620000,
+            status: 'final',
+            isPriced: false,
+            costUSD: 0,
+            date: '2026-11-13',
+            dateSource: 'created_at',
+            dateIsProvisional: false
+          }
+        }
+      }, null, 2),
+      'utf8'
+    );
+    const hist = await collectTokenHistoryAsync({
+      force: true,
+      agDir,
+      agCliDir: cliDir,
+      userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } }
+    });
+    assert.equal(hist.costEstimate.pricedCostUSD, 0.765);
+    assert.equal(hist.costEstimate.unpricedTokens, 0);
+
+    // 新入账的 Hydrogen 调用直接落盘 modelKey='gemini-4-hydrogen' 与准确费用
+    const recRes = recordModelCalls([parseGeneratorCall({
+      stepIndices: [2],
+      status: 'final',
+      created_at: '2026-11-13T12:00:00Z',
+      chatModel: {
+        modelDisplayName: 'Gemini 4 Hydrogen (XHigh)',
+        responseModel: 'gemini-4-hydrogen-xhigh',
+        usage: { inputTokens: 400000, cacheReadTokens: 200000, outputTokens: 20000, responseId: 'resp_h2_new' }
+      }
+    }, '11111111-aaaa-4444-8888-bbbbbbbbbbbb', 'desktop')], { agDir });
+    assert.equal(recRes.ok, true);
+    assert.equal(recRes.changed, true);
+    const savedNew = loadPricingLedger(agDir).calls.resp_h2_new;
+    assert.equal(savedNew.modelKey, 'gemini-4-hydrogen');
+    assert.equal(savedNew.isPriced, true);
+    assert.equal(savedNew.costUSD, 0.765);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(cliDir, { recursive: true, force: true });
+  }
+});
+test('Model usage breakdown: unifies desktop & CLI model variants and summarizes 7d/30d windows accurately', () => {
+  const {
+    resolveModelUsageBucket,
+    summarizeModelUsageWindow,
+    UNATTRIBUTED_MODEL_KEY
+  } = require('./meter-core');
+
+  const deskBucket = resolveModelUsageBucket({
+    model: 'Gemini 4 Hydrogen (Medium)',
+    modelExactId: 'MODEL_PLACEHOLDER_M526'
+  });
+  const cliBucket = resolveModelUsageBucket({
+    model: 'gemini-4-hydrogen-medium'
+  });
+  assert.equal(deskBucket.modelKey, 'gemini-4-hydrogen');
+  assert.equal(cliBucket.modelKey, 'gemini-4-hydrogen');
+  assert.equal(deskBucket.variantKey, 'gemini-4-hydrogen:medium');
+  assert.equal(cliBucket.variantKey, 'gemini-4-hydrogen:medium');
+  assert.equal(deskBucket.variantLabel, 'Gemini 4 Hydrogen (Medium)');
+  assert.equal(cliBucket.variantLabel, 'Gemini 4 Hydrogen (Medium)');
+
+  const unattr = resolveModelUsageBucket({ model: '' });
+  assert.equal(unattr.modelKey, UNATTRIBUTED_MODEL_KEY);
+  assert.equal(unattr.isAttributed, false);
+
+  const sampleMap = {
+    '2026-11-14': {
+      'gemini-4-hydrogen:medium': { total: 800, input: 100, cache: 600, output: 100, steps: 2 },
+      'gemini-4-argon:high': { total: 200, input: 50, cache: 100, output: 50, steps: 1 }
+    },
+    '2026-11-15': {
+      'gemini-4-hydrogen:xhigh': { total: 500, input: 100, cache: 300, output: 100, steps: 1 },
+      [UNATTRIBUTED_MODEL_KEY]: { total: 500, input: 50, cache: 400, output: 50, steps: 2 }
+    }
+  };
+  const meta = {
+    'gemini-4-hydrogen:medium': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:medium', variantLabel: 'Gemini 4 Hydrogen (Medium)' },
+    'gemini-4-hydrogen:xhigh': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:xhigh', variantLabel: 'Gemini 4 Hydrogen (XHigh)' },
+    'gemini-4-argon:high': { modelKey: 'gemini-4-argon', modelLabel: 'Gemini 4 Argon', variantKey: 'gemini-4-argon:high', variantLabel: 'Gemini 4 Argon (High)' }
+  };
+
+  const winModel = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 7,
+    endDate: '2026-11-16',
+    groupBy: 'model',
+    metric: 'total',
+    modelMetaByKey: meta
+  });
+  assert.equal(winModel.days.length, 7);
+  assert.equal(winModel.windowTotalTokens, 2000);
+  assert.equal(winModel.hasUnattributed, true);
+  assert.equal(winModel.legend[0].key, 'gemini-4-hydrogen');
+  assert.equal(winModel.legend[0].tokens, 1300);
+  assert.equal(winModel.legend[0].pctLabel, '65%');
+  assert.equal(winModel.legend[1].key, 'gemini-4-argon');
+  assert.equal(winModel.legend[1].pctLabel, '10%');
+  assert.equal(winModel.legend[2].key, UNATTRIBUTED_MODEL_KEY);
+  assert.equal(winModel.legend[2].pctLabel, '25%');
+
+  const winNoCacheVar = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 30,
+    endDate: '2026-11-16',
+    groupBy: 'variant',
+    metric: 'noCache',
+    hideUnattributed: true,
+    modelMetaByKey: meta
+  });
+  assert.equal(winNoCacheVar.days.length, 30);
+  assert.equal(winNoCacheVar.windowTotalTokens, 500); // (100+100) + (50+50) + (100+100)
+  assert.equal(winNoCacheVar.legend.length, 3);
+  assert.equal(winNoCacheVar.legend[0].label, 'Gemini 4 Hydrogen (Medium)');
+  assert.equal(winNoCacheVar.legend[0].pctLabel, '40%');
+});
+
+test('Model usage chart palette: native theme colors, custom accent, effort gradients and Claude amber', () => {
+  const {
+    getModelChartColor,
+    summarizeModelUsageWindow,
+    UNATTRIBUTED_MODEL_KEY
+  } = require('./meter-core');
+
+  const hexLuminance = (hex) => {
+    const clean = hex.replace('#', '');
+    const n = parseInt(clean, 16);
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const b = n & 255;
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+  };
+
+  assert.equal(getModelChartColor('gemini-4-hydrogen', 0, { theme: 'dark' }), '#a78bfa');
+  assert.equal(getModelChartColor('gemini-4-hydrogen', 0, { theme: 'light' }), '#7c3aed');
+  assert.equal(getModelChartColor('gemini-4-hydrogen', 0, { theme: 'dark', accentColor: '#22d3ee' }), '#22d3ee');
+  assert.equal(getModelChartColor('claude-opus-4.6-thinking', 0, { theme: 'dark' }), '#f59e0b');
+  assert.equal(getModelChartColor('claude-opus-4.6-thinking', 0, { theme: 'light' }), '#d97706');
+  assert.equal(getModelChartColor(UNATTRIBUTED_MODEL_KEY, 1, { theme: 'dark' }), 'rgba(161, 161, 170, 0.28)');
+  assert.equal(getModelChartColor(UNATTRIBUTED_MODEL_KEY, 1, { theme: 'light' }), 'rgba(113, 113, 122, 0.24)');
+
+  const cXHigh = getModelChartColor('gemini-4-hydrogen:xhigh', 0, { theme: 'dark' });
+  const cHigh = getModelChartColor('gemini-4-hydrogen:high', 0, { theme: 'dark' });
+  const cMedium = getModelChartColor('gemini-4-hydrogen:medium', 0, { theme: 'dark' });
+  assert.notEqual(cXHigh, cHigh);
+  assert.notEqual(cHigh, cMedium);
+  assert.ok(hexLuminance(cMedium) > hexLuminance(cHigh));
+  assert.ok(hexLuminance(cHigh) > hexLuminance(cXHigh));
+
+  // 当主模型使用与 gpt-oss 默认色冲突的自定义 accentColor 时，次模型应自动避让不撞色
+  const sampleMap = {
+    '2026-11-15': {
+      'gemini-4-hydrogen:medium': { total: 800, input: 100, cache: 600, output: 100, steps: 1 },
+      'gpt-oss-120b': { total: 200, input: 50, cache: 100, output: 50, steps: 1 }
+    }
+  };
+  const win = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 7,
+    endDate: '2026-11-16',
+    theme: 'dark',
+    accentColor: '#10b981'
+  });
+  assert.equal(win.legend[0].color, '#10b981');
+  assert.notEqual(win.legend[1].color, '#10b981');
+});
+
+test('Conversation DB gen_metadata backfill recovers missing transcript models and preserves v2 archive', async (t) => {
+  const fsMod = require('fs');
+  const osMod = require('os');
+  const pathMod = require('path');
+  const {
+    collectTokenHistoryAsync,
+    buildSqliteImmutableUri,
+    extractStepModelsFromGenMetadataBlob
+  } = require('./meter-collector');
+
+  const encodeVarint = (n) => {
+    const out = [];
+    let v = Number(n);
+    while (v >= 0x80) {
+      out.push((v % 128) | 0x80);
+      v = Math.floor(v / 128);
+    }
+    out.push(v);
+    return Buffer.from(out);
+  };
+  const encodeFieldBytes = (fn, payload) => Buffer.concat([
+    encodeVarint(fn * 8 + 2),
+    encodeVarint(payload.length),
+    payload
+  ]);
+  const encodeFieldVarint = (fn, val) => Buffer.concat([
+    encodeVarint(fn * 8 + 0),
+    encodeVarint(val)
+  ]);
+  const encodeGenBlob = ({ steps, rawModel, label, packed = true }) => {
+    const inner = [];
+    if (rawModel) inner.push(encodeFieldBytes(19, Buffer.from(rawModel, 'utf8')));
+    if (label) inner.push(encodeFieldBytes(21, Buffer.from(label, 'utf8')));
+    const parts = [encodeFieldBytes(1, Buffer.concat(inner))];
+    if (packed) {
+      parts.push(encodeFieldBytes(2, Buffer.concat(steps.map(encodeVarint))));
+    } else {
+      steps.forEach(s => parts.push(encodeFieldVarint(2, s)));
+    }
+    return Buffer.concat(parts);
+  };
+
+  assert.equal(
+    buildSqliteImmutableUri('\\\\wsl.localhost\\Ubuntu-26.04\\home\\u\\.gemini\\antigravity-cli\\conversations\\c1.db'),
+    'file:////wsl.localhost/Ubuntu-26.04/home/u/.gemini/antigravity-cli/conversations/c1.db?immutable=1'
+  );
+  assert.equal(
+    buildSqliteImmutableUri('C:\\dir with space\\a#1.db'),
+    'file:///C:/dir%20with%20space/a%231.db?immutable=1'
+  );
+
+  const blobA = encodeGenBlob({ steps: [2, 3], rawModel: 'MODEL_PLACEHOLDER_M18', label: 'Gemini 3.8 Flash (High)', packed: true });
+  const blobB = encodeGenBlob({ steps: [5], rawModel: 'gemini-3.8-flash-n', packed: false });
+  const blobC = encodeGenBlob({ steps: [7], rawModel: 'MODEL_PLACEHOLDER_M667', label: 'Orchestrator (Carbon)', packed: true });
+  assert.deepEqual(extractStepModelsFromGenMetadataBlob(blobA), [
+    { stepIndex: 2, model: 'Gemini 3.8 Flash (High)' },
+    { stepIndex: 3, model: 'Gemini 3.8 Flash (High)' }
+  ]);
+  assert.deepEqual(extractStepModelsFromGenMetadataBlob(blobB), [
+    { stepIndex: 5, model: 'gemini-3.8-flash-n' }
+  ]);
+  assert.deepEqual(extractStepModelsFromGenMetadataBlob(Buffer.from([0xff, 0xff])), []);
+
+  let DatabaseSync = null;
+  try { DatabaseSync = require('node:sqlite').DatabaseSync; } catch { }
+  if (!DatabaseSync) {
+    t.skip('node:sqlite unavailable in current Node runtime');
+    return;
+  }
+
+  const tmpRoot = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'ag-db-backfill-'));
+  const agDir = pathMod.join(tmpRoot, 'ag');
+  const agCliDir = pathMod.join(tmpRoot, 'ag-cli');
+  const cid = '11111111-2222-3333-4444-555555555555';
+  const logsDir = pathMod.join(agDir, 'brain', cid, '.system_generated', 'logs');
+  const convDir = pathMod.join(agDir, 'conversations');
+  fsMod.mkdirSync(logsDir, { recursive: true });
+  fsMod.mkdirSync(convDir, { recursive: true });
+  fsMod.mkdirSync(agCliDir, { recursive: true });
+
+  const todayIso = new Date().toISOString();
+  const todayKey = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+  const dbPath = pathMod.join(convDir, `${cid}.db`);
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER)');
+    const insertStmt = db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)');
+    insertStmt.run(1, blobA, blobA.length);
+    insertStmt.run(2, blobB, blobB.length);
+    insertStmt.run(3, blobC, blobC.length);
+  } finally {
+    db.close();
+  }
+
+  fsMod.writeFileSync(pathMod.join(logsDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 2, created_at: todayIso, input_tokens: 1000, cache_read_tokens: 2000, output_tokens: 300 }),
+    JSON.stringify({ step_index: 5, created_at: todayIso, input_tokens: 400, cache_read_tokens: 500, output_tokens: 100 }),
+    JSON.stringify({ step_index: 7, model: 'gemini-pro-orchestrator', created_at: todayIso, input_tokens: 500, cache_read_tokens: 100, output_tokens: 50 }),
+    JSON.stringify({ step_index: 9, created_at: todayIso, input_tokens: 100, cache_read_tokens: 0, output_tokens: 50 })
+  ].join('\n'), 'utf8');
+
+  try {
+    const res1 = await collectTokenHistoryAsync({
+      agDir,
+      agCliDir,
+      force: true
+    });
+    const dayModels = res1.dailyModelMapBySource?.desktop?.[todayKey] || {};
+    assert.equal(dayModels['gemini-3.8-flash:high']?.total, 3300);
+    assert.equal(dayModels['gemini-3.8-flash']?.total, 1000);
+    assert.equal(dayModels['orchestrator:carbon']?.total, 650);
+    assert.equal(dayModels.__unattributed__?.total, 150);
+
+    const archiveV2 = JSON.parse(fsMod.readFileSync(pathMod.join(agDir, 'token_usage_archive_v2.json'), 'utf8'));
+    assert.equal(archiveV2.dailyModelMapBySource?.desktop?.[todayKey]?.['gemini-3.8-flash:high']?.total, 3300);
+    assert.equal(archiveV2.dailyModelMapBySource?.desktop?.[todayKey]?.['orchestrator:carbon']?.total, 650);
+
+    const res2 = await collectTokenHistoryAsync({
+      agDir,
+      agCliDir
+    });
+    assert.equal(res2.dailyModelMapBySource?.desktop?.[todayKey]?.['gemini-3.8-flash:high']?.total, 3300);
+    assert.equal(res2.dailyModelMapBySource?.desktop?.[todayKey]?.['orchestrator:carbon']?.total, 650);
+  } finally {
+    fsMod.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('ELV-83: parseUserPlanStatus、resolveEffectivePlanStatus 与严格 allowedTiers 权限矩阵验证', () => {
+  const {
+    classifyModelQuotaAvailability,
+    buildModelQuotaSnapshot
+  } = require('./meter-core');
+
+  // 1. 保留与透传 teamsTier（live / cached_live / custom 补充场景）
+  const ultraFeedbackPlan = parseUserPlanStatus({
+    userStatus: {
+      email: 'ultra.user@example.com',
+      userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra' },
+      planStatus: { planInfo: { teamsTier: 'TEAMS_TIER_PRO', planName: 'Pro' } }
+    }
+  });
+  assert.equal(ultraFeedbackPlan.status, 'identified');
+  assert.equal(ultraFeedbackPlan.tierKey, 'ultra');
+  assert.equal(ultraFeedbackPlan.tierId, 'g1-ultra-tier');
+  assert.equal(ultraFeedbackPlan.teamsTier, 'TEAMS_TIER_PRO');
+
+  const effLive = resolveEffectivePlanStatus(ultraFeedbackPlan, { subscriptionRegion: '美国 (US)' });
+  assert.equal(effLive.teamsTier, 'TEAMS_TIER_PRO');
+  assert.equal(effLive.tierId, 'g1-ultra-tier');
+
+  const effCached = resolveEffectivePlanStatus(null, null, { cachedLivePlan: ultraFeedbackPlan });
+  assert.equal(effCached.teamsTier, 'TEAMS_TIER_PRO');
+  assert.equal(effCached.tierId, 'g1-ultra-tier');
+
+  // 仅凭 planInfo.teamsTier 也可识别套餐
+  const onlyTeamsTier = parseUserPlanStatus({
+    userStatus: {
+      email: 'teams@example.com',
+      planStatus: { planInfo: { teamsTier: 'TEAMS_TIER_PRO_ULTIMATE' } }
+    }
+  });
+  assert.equal(onlyTeamsTier.status, 'identified');
+  assert.equal(onlyTeamsTier.tierKey, 'ultra');
+  assert.equal(onlyTeamsTier.teamsTier, 'TEAMS_TIER_PRO_ULTIMATE');
+
+  // 2. Pro 套餐面对仅限 Ultra 的 TEAMS_TIER_PRO_ULTIMATE 必须拦截（禁止子串 includes 误放行）
+  const proPlan = { status: 'identified', tierKey: 'pro', tierId: 'g1-pro-tier', teamsTier: 'TEAMS_TIER_PRO' };
+  const ultraOnlyModel = {
+    label: 'Gemini 4 Carbon (XHigh)',
+    tagTitle: 'New',
+    allowedTiers: ['TEAMS_TIER_PRO_ULTIMATE'],
+    quotaInfo: { remainingFraction: 0.9 }
+  };
+  const proOnUltraModel = classifyModelQuotaAvailability(ultraOnlyModel, proPlan);
+  assert.equal(proOnUltraModel.noPermission, true, 'Pro 不得因 TEAMS_TIER_PRO_ULTIMATE 包含 TEAMS_TIER_PRO 而被误放行');
+  assert.match(proOnUltraModel.reason || '', /TEAMS_TIER_PRO_ULTIMATE/);
+  assert.notEqual(proOnUltraModel.reason, 'New');
+
+  // Pro 面对 TEAMS_TIER_PRO 模型应正常放行（含缺少 teamsTier 时按 tierKey 推导）
+  const proSharedModel = { label: 'Gemini 4 Hydrogen', tagTitle: 'New', allowedTiers: ['TEAMS_TIER_PRO', 'TEAMS_TIER_PRO_ULTIMATE'] };
+  assert.equal(classifyModelQuotaAvailability(proSharedModel, proPlan).noPermission, false);
+  assert.equal(classifyModelQuotaAvailability(proSharedModel, { status: 'identified', tierKey: 'pro', tierId: 'g1-pro-tier', teamsTier: null }).noPermission, false);
+
+  // 3. Ultra 账号（含 TEAMS_TIER_PRO 与缺失 teamsTier）允许 Carbon / Hydrogen / Sonnet，但拦截企业专享模型
+  assert.equal(classifyModelQuotaAvailability(ultraOnlyModel, ultraFeedbackPlan).noPermission, false);
+  assert.equal(classifyModelQuotaAvailability(ultraOnlyModel, { status: 'identified', tierKey: 'ultra', tierId: 'g1-ultra-tier', teamsTier: null }).noPermission, false);
+  const entOnly = classifyModelQuotaAvailability(
+    { label: 'Enterprise Private', tagTitle: 'New', allowedTiers: ['TEAMS_TIER_ENTERPRISE_SAAS'] },
+    ultraFeedbackPlan
+  );
+  assert.equal(entOnly.noPermission, true);
+  assert.match(entOnly.reason || '', /TEAMS_TIER_ENTERPRISE_SAAS/);
+
+  // 4. 真正受限套餐（Free 无 ID / Free 有 ID / 名称包含 ultra 的过期或非官方 custom 套餐）必须拦截
+  assert.equal(classifyModelQuotaAvailability(proSharedModel, { status: 'identified', tierKey: 'free', tierId: null, teamsTier: null }).noPermission, true);
+  assert.equal(classifyModelQuotaAvailability(proSharedModel, { status: 'identified', tierKey: 'free', tierId: 'free-tier', teamsTier: 'TEAMS_TIER_FREE' }).noPermission, true);
+  assert.equal(classifyModelQuotaAvailability(ultraOnlyModel, { status: 'identified', tierKey: 'custom', tierId: 'ultra_expired', teamsTier: null }).noPermission, true);
+
+  // 5. 服务端明确禁用时，即使套餐允许且 quotaInfo 返回剩余百分比，也必须判无权限且 New 不覆盖故障原因
+  const serverDisabledWithPct = classifyModelQuotaAvailability(
+    {
+      label: 'Gemini 4 Carbon',
+      tagTitle: 'New',
+      disabled: true,
+      unavailabilityReason: 'New',
+      allowedTiers: ['TEAMS_TIER_PRO', 'TEAMS_TIER_PRO_ULTIMATE'],
+      quotaInfo: { remainingFraction: 0.88 }
+    },
+    ultraFeedbackPlan
+  );
+  assert.equal(serverDisabledWithPct.noPermission, true);
+  assert.equal(serverDisabledWithPct.reason, '当前套餐无权访问该模型');
+
+  // 6. 未知套餐不按 allowedTiers 猜测误判无权限，保持 unknown 状态
+  const unknownPlanSnap = buildModelQuotaSnapshot({
+    userStatusRes: {
+      userStatus: {
+        cascadeModelConfigData: {
+          clientModelConfigs: [
+            { modelId: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen', allowedTiers: ['TEAMS_TIER_PRO'] }
+          ]
+        }
+      }
+    },
+    currentModel: 'gemini-4-hydrogen'
+  });
+  assert.equal(unknownPlanSnap.activeStatus, 'unknown');
+  assert.equal(unknownPlanSnap.pools[0]?.noPermission, false);
+});
+
+test('parseLxssRegistryOutput parses active WSL distros and filters container-runtime or non-ready entries', () => {
+  const { parseLxssRegistryOutput } = require('./meter-collector');
+  const raw = [
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
+    '    DefaultDistribution    REG_SZ    {11111111-1111-1111-1111-111111111111}',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{11111111-1111-1111-1111-111111111111}',
+    '    State    REG_DWORD    0x1',
+    '    DistributionName    REG_SZ    Ubuntu-24.04',
+    '    Version    REG_DWORD    0x2',
+    '    DefaultUid    REG_DWORD    0x0',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{22222222-2222-2222-2222-222222222222}',
+    '    State    REG_DWORD    0x1',
+    '    DistributionName    REG_SZ    docker-desktop',
+    '    Version    REG_DWORD    0x2',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{33333333-3333-3333-3333-333333333333}',
+    '    State    REG_DWORD    0x1',
+    '    DistributionName    REG_SZ    docker-desktop-data',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{44444444-4444-4444-4444-444444444444}',
+    '    State    REG_DWORD    0x4',
+    '    DistributionName    REG_SZ    Debian-Uninstalling',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{55555555-5555-5555-5555-555555555555}',
+    '    State    REG_DWORD    1',
+    '    DistributionName    REG_SZ    Arch',
+    '    Version    REG_DWORD    2',
+    '    DefaultUid    REG_DWORD    1000',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{66666666-6666-6666-6666-666666666666}',
+    '    State    REG_DWORD    0x1',
+    '    DistributionName    REG_SZ    ubuntu-24.04',
+    ''
+  ].join('\r\n');
+
+  const parsed = parseLxssRegistryOutput(raw);
+  assert.deepEqual(parsed, [
+    { name: 'Ubuntu-24.04', state: 1, version: 2, defaultUid: 0 },
+    { name: 'Arch', state: 1, version: 2, defaultUid: 1000 }
+  ]);
+  assert.deepEqual(parseLxssRegistryOutput(''), []);
+});
+
+test('resolveWslDistroUncRoot and discoverWslGeminiDirs handle wsl.localhost preference, wsl$ fallback and isolation guards', () => {
+  const {
+    resolveWslDistroUncRoot,
+    collectGeminiDirsFromLinuxRoot,
+    discoverWslGeminiDirs,
+    getEffectiveScanScopeKey
+  } = require('./meter-collector');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const existingUnc = new Set([
+    '\\\\wsl.localhost\\Ubuntu-24.04\\root',
+    '\\\\wsl$\\Ubuntu-24.04\\root',
+    '\\\\wsl$\\DebianLegacy\\home'
+  ]);
+  const fakeFs = {
+    existsSync: (p) => existingUnc.has(p)
+  };
+  assert.equal(resolveWslDistroUncRoot('Ubuntu-24.04', { fs: fakeFs }), '\\\\wsl.localhost\\Ubuntu-24.04');
+  assert.equal(resolveWslDistroUncRoot('DebianLegacy', { fs: fakeFs }), '\\\\wsl$\\DebianLegacy');
+  assert.equal(resolveWslDistroUncRoot('MissingDistro', { fs: fakeFs }), null);
+
+  const tmpWslRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wsl-root-'));
+  try {
+    fs.mkdirSync(path.join(tmpWslRoot, 'root', '.gemini', 'antigravity', 'brain'), { recursive: true });
+    fs.mkdirSync(path.join(tmpWslRoot, 'home', 'alice', '.gemini', 'antigravity', 'brain'), { recursive: true });
+    fs.mkdirSync(path.join(tmpWslRoot, 'home', 'alice', '.gemini', 'antigravity-cli', 'brain'), { recursive: true });
+    fs.mkdirSync(path.join(tmpWslRoot, 'home', 'bob'), { recursive: true });
+
+    const found = collectGeminiDirsFromLinuxRoot(tmpWslRoot);
+    assert.equal(found.desktopDirs.length, 2);
+    assert.equal(found.cliDirs.length, 1);
+
+    const disabledByOpt = discoverWslGeminiDirs({ includeWsl: false, wslRoots: [tmpWslRoot] });
+    assert.deepEqual(disabledByOpt.desktopDirs, []);
+    assert.deepEqual(disabledByOpt.cliDirs, []);
+
+    const prevDisable = process.env.AG_DISABLE_WSL_SCAN;
+    process.env.AG_DISABLE_WSL_SCAN = '1';
+    try {
+      const disabledByEnv = discoverWslGeminiDirs({ includeWsl: true, wslRoots: [tmpWslRoot] });
+      assert.deepEqual(disabledByEnv.desktopDirs, []);
+    } finally {
+      if (prevDisable === undefined) delete process.env.AG_DISABLE_WSL_SCAN;
+      else process.env.AG_DISABLE_WSL_SCAN = prevDisable;
+    }
+
+    const withRoots = discoverWslGeminiDirs({ agDir: tmpWslRoot, wslRoots: [tmpWslRoot] });
+    assert.deepEqual(withRoots.distros, []);
+    assert.equal(withRoots.desktopDirs.length, 2);
+    assert.equal(withRoots.cliDirs.length, 1);
+
+    assert.notEqual(
+      getEffectiveScanScopeKey({ agDir: tmpWslRoot, includeWsl: false }),
+      getEffectiveScanScopeKey({ agDir: tmpWslRoot, includeWsl: true, wslRoots: [tmpWslRoot] })
+    );
+  } finally {
+    fs.rmSync(tmpWslRoot, { recursive: true, force: true });
+  }
+});
+
+test('collectTokenHistoryAsync aggregates WSL desktop/cli sessions without double-counting or writing into WSL dirs', async () => {
+  const { formatLocalDateKey } = require('./meter-collector');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+
+  const winAgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-win-primary-'));
+  const winCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-win-cli-'));
+  const wslRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wsl-distro-'));
+
+  try {
+    const ts1 = '2026-11-15T10:00:00Z';
+    const ts2 = '2026-11-16T10:00:00Z';
+    const ts3 = '2026-11-16T11:00:00Z';
+    const d1 = formatLocalDateKey(new Date(ts1));
+    const d2 = formatLocalDateKey(new Date(ts2));
+
+    // Windows 主目录会话（含与 WSL 重复的 eventId & conversation 名称，用于验证去重）
+    const winConvDir = path.join(winAgDir, 'conversations');
+    const winBrainDir = path.join(winAgDir, 'brain', 'conv-shared', '.system_generated', 'logs');
+    fs.mkdirSync(winConvDir, { recursive: true });
+    fs.mkdirSync(winBrainDir, { recursive: true });
+    fs.writeFileSync(path.join(winConvDir, 'conv-shared.db'), 'db');
+    fs.writeFileSync(path.join(winConvDir, 'conv-shared.db-wal'), 'wal');
+    fs.writeFileSync(path.join(winBrainDir, 'transcript.jsonl'), JSON.stringify({
+      created_at: ts1,
+      step_index: 1,
+      model: 'gemini-3.8-flash',
+      chatModel: { usage: { inputTokens: 1000, cacheReadTokens: 500, outputTokens: 200, responseId: 'resp_shared_1' } }
+    }) + '\n', 'utf8');
+
+    // WSL /root desktop 目录（1 条重复事件 + 1 条 WSL 独有事件）
+    const wslRootAg = path.join(wslRoot, 'root', '.gemini', 'antigravity');
+    const wslRootConv = path.join(wslRootAg, 'conversations');
+    const wslRootSharedBrain = path.join(wslRootAg, 'brain', 'conv-shared', '.system_generated', 'logs');
+    const wslRootNewBrain = path.join(wslRootAg, 'brain', 'conv-wsl-only', '.system_generated', 'logs');
+    fs.mkdirSync(wslRootConv, { recursive: true });
+    fs.mkdirSync(wslRootSharedBrain, { recursive: true });
+    fs.mkdirSync(wslRootNewBrain, { recursive: true });
+    fs.writeFileSync(path.join(wslRootConv, 'conv-shared.db'), 'dup-db');
+    fs.writeFileSync(path.join(wslRootConv, 'conv-wsl-only.db'), 'wsl-db');
+    fs.writeFileSync(path.join(wslRootSharedBrain, 'transcript.jsonl'), JSON.stringify({
+      created_at: ts1,
+      step_index: 1,
+      model: 'gemini-3.8-flash',
+      chatModel: { usage: { inputTokens: 1000, cacheReadTokens: 500, outputTokens: 200, responseId: 'resp_shared_1' } }
+    }) + '\n', 'utf8');
+    fs.writeFileSync(path.join(wslRootNewBrain, 'transcript.jsonl'), JSON.stringify({
+      created_at: ts2,
+      step_index: 2,
+      model: 'gemini-3.8-flash',
+      chatModel: { usage: { inputTokens: 4000, cacheReadTokens: 2000, outputTokens: 500, responseId: 'resp_wsl_2' } }
+    }) + '\n', 'utf8');
+
+    // WSL /home/alice antigravity-cli 目录（仅 WSL 侧有 CLI 记录）
+    const wslCliAg = path.join(wslRoot, 'home', 'alice', '.gemini', 'antigravity-cli');
+    const wslCliConv = path.join(wslCliAg, 'conversations');
+    const wslCliBrain = path.join(wslCliAg, 'brain', 'conv-wsl-cli', '.system_generated', 'logs');
+    fs.mkdirSync(wslCliConv, { recursive: true });
+    fs.mkdirSync(wslCliBrain, { recursive: true });
+    fs.writeFileSync(path.join(wslCliConv, 'conv-wsl-cli.pb'), 'pb');
+    fs.writeFileSync(path.join(wslCliBrain, 'transcript.jsonl'), JSON.stringify({
+      created_at: ts3,
+      step_index: 1,
+      model: 'gemini-3.8-flash',
+      chatModel: { usage: { inputTokens: 800, cacheReadTokens: 100, outputTokens: 100, responseId: 'resp_wsl_cli_1' } }
+    }) + '\n', 'utf8');
+
+    const res = await collectTokenHistoryAsync({
+      force: true,
+      agDir: winAgDir,
+      agCliDir: winCliDir,
+      wslRoots: [wslRoot],
+      userStatus: null
+    });
+
+    assert.equal(res.summary.totalInputTokens, 1000 + 4000 + 800);
+    assert.equal(res.summary.totalCacheTokens, 500 + 2000 + 100);
+    assert.equal(res.summary.totalOutputTokens, 200 + 500 + 100);
+    assert.equal(res.summary.grandTotalTokens, 1700 + 6500 + 1000);
+    assert.equal(res.summary.totalSteps, 3);
+    assert.equal(res.dailyMapBySource.desktop[d1].total, 1700);
+    assert.equal(res.dailyMapBySource.desktop[d2].total, 6500);
+    assert.equal(res.dailyMapBySource.cli[d2].total, 1000);
+    assert.equal(res.sources.desktop.conversationsCount, 2);
+    assert.equal(res.sources.cli.dirExists, true);
+    assert.equal(res.sources.cli.conversationsCount, 1);
+    assert.equal(res.sources.cli.transcriptsCount, 1);
+    assert.equal(res.sources.wsl.desktopDirsCount, 1);
+    assert.equal(res.sources.wsl.cliDirsCount, 1);
+
+    // 确认不会向 WSL 目录写入归档或账本文件（只读扫描 WSL）
+    assert.equal(fs.existsSync(path.join(wslRootAg, 'token_usage_archive_v2.json')), false);
+    assert.equal(fs.existsSync(path.join(wslRootAg, 'pricing_ledger_v1.json')), false);
+    assert.equal(fs.existsSync(path.join(winAgDir, 'token_usage_archive_v2.json')), true);
+  } finally {
+    fs.rmSync(winAgDir, { recursive: true, force: true });
+    fs.rmSync(winCliDir, { recursive: true, force: true });
+    fs.rmSync(wslRoot, { recursive: true, force: true });
+  }
+});
+
+test('Model usage breakdown: unifies desktop & CLI model variants and summarizes 7d/30d windows accurately', () => {
+  const {
+    resolveModelUsageBucket,
+    summarizeModelUsageWindow,
+    UNATTRIBUTED_MODEL_KEY
+  } = require('./meter-core');
+
+  const deskBucket = resolveModelUsageBucket({
+    model: 'Gemini 4 Hydrogen (Medium)',
+    modelExactId: 'MODEL_PLACEHOLDER_M526'
+  });
+  const cliBucket = resolveModelUsageBucket({
+    model: 'gemini-4-hydrogen-medium'
+  });
+  assert.equal(deskBucket.modelKey, 'gemini-4-hydrogen');
+  assert.equal(cliBucket.modelKey, 'gemini-4-hydrogen');
+  assert.equal(deskBucket.variantKey, 'gemini-4-hydrogen:medium');
+  assert.equal(cliBucket.variantKey, 'gemini-4-hydrogen:medium');
+  assert.equal(deskBucket.variantLabel, 'Gemini 4 Hydrogen (Medium)');
+  assert.equal(cliBucket.variantLabel, 'Gemini 4 Hydrogen (Medium)');
+
+  const unattr = resolveModelUsageBucket({ model: '' });
+  assert.equal(unattr.modelKey, UNATTRIBUTED_MODEL_KEY);
+  assert.equal(unattr.isAttributed, false);
+
+  const sampleMap = {
+    '2026-11-14': {
+      'gemini-4-hydrogen:medium': { total: 800, input: 100, cache: 600, output: 100, steps: 2 },
+      'gemini-4-argon:high': { total: 200, input: 50, cache: 100, output: 50, steps: 1 }
+    },
+    '2026-11-15': {
+      'gemini-4-hydrogen:xhigh': { total: 500, input: 100, cache: 300, output: 100, steps: 1 },
+      [UNATTRIBUTED_MODEL_KEY]: { total: 500, input: 50, cache: 400, output: 50, steps: 2 }
+    }
+  };
+  const meta = {
+    'gemini-4-hydrogen:medium': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:medium', variantLabel: 'Gemini 4 Hydrogen (Medium)' },
+    'gemini-4-hydrogen:xhigh': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:xhigh', variantLabel: 'Gemini 4 Hydrogen (XHigh)' },
+    'gemini-4-argon:high': { modelKey: 'gemini-4-argon', modelLabel: 'Gemini 4 Argon', variantKey: 'gemini-4-argon:high', variantLabel: 'Gemini 4 Argon (High)' }
+  };
+
+  const winModel = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 7,
+    endDate: '2026-11-16',
+    groupBy: 'model',
+    metric: 'total',
+    modelMetaByKey: meta
+  });
+  assert.equal(winModel.days.length, 7);
+  assert.equal(winModel.windowTotalTokens, 2000);
+  assert.equal(winModel.hasUnattributed, true);
+  assert.equal(winModel.legend[0].key, 'gemini-4-hydrogen');
+  assert.equal(winModel.legend[0].tokens, 1300);
+  assert.equal(winModel.legend[0].pctLabel, '65%');
+  assert.equal(winModel.legend[1].key, 'gemini-4-argon');
+  assert.equal(winModel.legend[1].pctLabel, '10%');
+  assert.equal(winModel.legend[2].key, UNATTRIBUTED_MODEL_KEY);
+  assert.equal(winModel.legend[2].pctLabel, '25%');
+
+  const winNoCacheVar = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 30,
+    endDate: '2026-11-16',
+    groupBy: 'variant',
+    metric: 'noCache',
+    hideUnattributed: true,
+    modelMetaByKey: meta
+  });
+  assert.equal(winNoCacheVar.days.length, 30);
+  assert.equal(winNoCacheVar.windowTotalTokens, 500); // (100+100) + (50+50) + (100+100)
+  assert.equal(winNoCacheVar.legend.length, 3);
+  assert.equal(winNoCacheVar.legend[0].label, 'Gemini 4 Hydrogen (Medium)');
+  assert.equal(winNoCacheVar.legend[0].pctLabel, '40%');
+});
+
+test('Model usage chart palette: native theme colors, custom accent, effort gradients and Claude amber', () => {
+  const {
+    getModelChartColor,
+    summarizeModelUsageWindow,
+    UNATTRIBUTED_MODEL_KEY
+  } = require('./meter-core');
+
+  const hexLuminance = (hex) => {
+    const clean = hex.replace('#', '');
+    const n = parseInt(clean, 16);
+    const r = (n >> 16) & 255;
+    const g = (n >> 8) & 255;
+    const b = n & 255;
+    return 0.299 * r + 0.587 * g + 0.114 * b;
+  };
+
+  assert.equal(getModelChartColor('gemini-4-hydrogen', 0, { theme: 'dark' }), '#a78bfa');
+  assert.equal(getModelChartColor('gemini-4-hydrogen', 0, { theme: 'light' }), '#7c3aed');
+  assert.equal(getModelChartColor('gemini-4-hydrogen', 0, { theme: 'dark', accentColor: '#22d3ee' }), '#22d3ee');
+  assert.equal(getModelChartColor('claude-opus-4.6-thinking', 0, { theme: 'dark' }), '#f59e0b');
+  assert.equal(getModelChartColor('claude-opus-4.6-thinking', 0, { theme: 'light' }), '#d97706');
+  assert.equal(getModelChartColor(UNATTRIBUTED_MODEL_KEY, 1, { theme: 'dark' }), 'rgba(161, 161, 170, 0.28)');
+  assert.equal(getModelChartColor(UNATTRIBUTED_MODEL_KEY, 1, { theme: 'light' }), 'rgba(113, 113, 122, 0.24)');
+
+  const cXHigh = getModelChartColor('gemini-4-hydrogen:xhigh', 0, { theme: 'dark' });
+  const cHigh = getModelChartColor('gemini-4-hydrogen:high', 0, { theme: 'dark' });
+  const cMedium = getModelChartColor('gemini-4-hydrogen:medium', 0, { theme: 'dark' });
+  assert.notEqual(cXHigh, cHigh);
+  assert.notEqual(cHigh, cMedium);
+  assert.ok(hexLuminance(cMedium) > hexLuminance(cHigh));
+  assert.ok(hexLuminance(cHigh) > hexLuminance(cXHigh));
+
+  // 当主模型使用与 gpt-oss 默认色冲突的自定义 accentColor 时，次模型应自动避让不撞色
+  const sampleMap = {
+    '2026-11-15': {
+      'gemini-4-hydrogen:medium': { total: 800, input: 100, cache: 600, output: 100, steps: 1 },
+      'gpt-oss-120b': { total: 200, input: 50, cache: 100, output: 50, steps: 1 }
+    }
+  };
+  const win = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 7,
+    endDate: '2026-11-16',
+    theme: 'dark',
+    accentColor: '#10b981'
+  });
+  assert.equal(win.legend[0].color, '#10b981');
+  assert.notEqual(win.legend[1].color, '#10b981');
+});
+
+test('Conversation DB gen_metadata backfill recovers missing transcript models and preserves v2 archive', async (t) => {
+  const fsMod = require('fs');
+  const osMod = require('os');
+  const pathMod = require('path');
+  const {
+    collectTokenHistoryAsync,
+    buildSqliteImmutableUri,
+    extractStepModelsFromGenMetadataBlob
+  } = require('./meter-collector');
+
+  const encodeVarint = (n) => {
+    const out = [];
+    let v = Number(n);
+    while (v >= 0x80) {
+      out.push((v % 128) | 0x80);
+      v = Math.floor(v / 128);
+    }
+    out.push(v);
+    return Buffer.from(out);
+  };
+  const encodeFieldBytes = (fn, payload) => Buffer.concat([
+    encodeVarint(fn * 8 + 2),
+    encodeVarint(payload.length),
+    payload
+  ]);
+  const encodeFieldVarint = (fn, val) => Buffer.concat([
+    encodeVarint(fn * 8 + 0),
+    encodeVarint(val)
+  ]);
+  const encodeGenBlob = ({ steps, rawModel, label, packed = true }) => {
+    const inner = [];
+    if (rawModel) inner.push(encodeFieldBytes(19, Buffer.from(rawModel, 'utf8')));
+    if (label) inner.push(encodeFieldBytes(21, Buffer.from(label, 'utf8')));
+    const parts = [encodeFieldBytes(1, Buffer.concat(inner))];
+    if (packed) {
+      parts.push(encodeFieldBytes(2, Buffer.concat(steps.map(encodeVarint))));
+    } else {
+      steps.forEach(s => parts.push(encodeFieldVarint(2, s)));
+    }
+    return Buffer.concat(parts);
+  };
+
+  assert.equal(
+    buildSqliteImmutableUri('\\\\wsl.localhost\\Ubuntu-26.04\\home\\u\\.gemini\\antigravity-cli\\conversations\\c1.db'),
+    'file:////wsl.localhost/Ubuntu-26.04/home/u/.gemini/antigravity-cli/conversations/c1.db?immutable=1'
+  );
+  assert.equal(
+    buildSqliteImmutableUri('C:\\dir with space\\a#1.db'),
+    'file:///C:/dir%20with%20space/a%231.db?immutable=1'
+  );
+
+  const blobA = encodeGenBlob({ steps: [2, 3], rawModel: 'MODEL_PLACEHOLDER_M18', label: 'Gemini 3.8 Flash (High)', packed: true });
+  const blobB = encodeGenBlob({ steps: [5], rawModel: 'gemini-3.8-flash-n', packed: false });
+  assert.deepEqual(extractStepModelsFromGenMetadataBlob(blobA), [
+    { stepIndex: 2, model: 'Gemini 3.8 Flash (High)' },
+    { stepIndex: 3, model: 'Gemini 3.8 Flash (High)' }
+  ]);
+  assert.deepEqual(extractStepModelsFromGenMetadataBlob(blobB), [
+    { stepIndex: 5, model: 'gemini-3.8-flash-n' }
+  ]);
+  assert.deepEqual(extractStepModelsFromGenMetadataBlob(Buffer.from([0xff, 0xff])), []);
+
+  let DatabaseSync = null;
+  try { DatabaseSync = require('node:sqlite').DatabaseSync; } catch { }
+  if (!DatabaseSync) {
+    t.skip('node:sqlite unavailable in current Node runtime');
+    return;
+  }
+
+  const tmpRoot = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'ag-db-backfill-'));
+  const agDir = pathMod.join(tmpRoot, 'ag');
+  const agCliDir = pathMod.join(tmpRoot, 'ag-cli');
+  const cid = '11111111-2222-3333-4444-555555555555';
+  const logsDir = pathMod.join(agDir, 'brain', cid, '.system_generated', 'logs');
+  const convDir = pathMod.join(agDir, 'conversations');
+  fsMod.mkdirSync(logsDir, { recursive: true });
+  fsMod.mkdirSync(convDir, { recursive: true });
+  fsMod.mkdirSync(agCliDir, { recursive: true });
+
+  const todayIso = new Date().toISOString();
+  const todayKey = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`;
+  const dbPath = pathMod.join(convDir, `${cid}.db`);
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER)');
+    const insertStmt = db.prepare('INSERT INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)');
+    insertStmt.run(1, blobA, blobA.length);
+    insertStmt.run(2, blobB, blobB.length);
+  } finally {
+    db.close();
+  }
+
+  fsMod.writeFileSync(pathMod.join(logsDir, 'transcript.jsonl'), [
+    JSON.stringify({ step_index: 2, created_at: todayIso, input_tokens: 1000, cache_read_tokens: 2000, output_tokens: 300 }),
+    JSON.stringify({ step_index: 5, created_at: todayIso, input_tokens: 400, cache_read_tokens: 500, output_tokens: 100 }),
+    JSON.stringify({ step_index: 9, created_at: todayIso, input_tokens: 100, cache_read_tokens: 0, output_tokens: 50 })
+  ].join('\n'), 'utf8');
+
+  try {
+    const res1 = await collectTokenHistoryAsync({
+      agDir,
+      agCliDir,
+      force: true
+    });
+    const dayModels = res1.dailyModelMapBySource?.desktop?.[todayKey] || {};
+    assert.equal(dayModels['gemini-3.8-flash:high']?.total, 3300);
+    assert.equal(dayModels['gemini-3.8-flash']?.total, 1000);
+    assert.equal(dayModels.__unattributed__?.total, 150);
+
+    const archiveV2 = JSON.parse(fsMod.readFileSync(pathMod.join(agDir, 'token_usage_archive_v2.json'), 'utf8'));
+    assert.equal(archiveV2.dailyModelMapBySource?.desktop?.[todayKey]?.['gemini-3.8-flash:high']?.total, 3300);
+
+    const res2 = await collectTokenHistoryAsync({
+      agDir,
+      agCliDir
+    });
+    assert.equal(res2.dailyModelMapBySource?.desktop?.[todayKey]?.['gemini-3.8-flash:high']?.total, 3300);
+  } finally {
+    fsMod.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('v0.8.8 chart visual scale: continuous piecewise anchor interpolation (zero cross-tier shrink), monotonic boundaries, overflow cap and cumulative A+C summary', () => {
+  const {
+    computeMixedScaleResponse,
+    computeColorScaleResponse,
+    resolveScaleEnvelope,
+    mapBubbleDiameter,
+    mapBarHeightPx,
+    allocateStackedSegmentHeights,
+    interpolateScaleColorHsl,
+    shouldShowYearlyPeakBadge,
+    computeLogRulerPosition,
+    computeCumulativeStripSummary
+  } = require('./meter-core');
+
+  // 1. 同一气泡/日柱/周柱跨所有包络边界 (a-1, a, a+1) 必须严格连续单调不缩小，且跨包络切换后同值像素/颜色完全稳定
+  const bubbleBoundaries = [100e3, 1e6, 10e6, 100e6, 1e9];
+  const expectedBubbleCaps = [24, 32, 40, 49, 58];
+  bubbleBoundaries.forEach((b, idx) => {
+    const envLo = resolveScaleEnvelope(b - 1, 'yearly');
+    const envAt = resolveScaleEnvelope(b, 'yearly');
+    const envHi = resolveScaleEnvelope(b + 1, 'yearly');
+    const dLo = mapBubbleDiameter(b - 1, envLo).diameter;
+    const dAt = mapBubbleDiameter(b, envAt).diameter;
+    const dHi = mapBubbleDiameter(b + 1, envHi).diameter;
+    assert.ok(Math.abs(dAt - expectedBubbleCaps[idx]) < 1e-6, `气泡锚点 ${b} 应精确等于 ${expectedBubbleCaps[idx]}px`);
+    assert.ok(dLo <= dAt && dAt <= dHi, `气泡边界 ${b}: ${dLo} <= ${dAt} <= ${dHi} 不得跨档缩小`);
+    // 验证同值点 1.82M / 100K / 100M 在更高包络下绝对尺寸与颜色不变
+    assert.equal(mapBubbleDiameter(1.82e6, envLo).diameter, mapBubbleDiameter(1.82e6, envHi).diameter);
+    assert.equal(computeColorScaleResponse(100e6, 'yearly'), computeColorScaleResponse(100e6, 'yearly'));
+  });
+  const env100M = resolveScaleEnvelope(100e6, 'yearly');
+  const env1B = resolveScaleEnvelope(1e9, 'yearly');
+  assert.equal(mapBubbleDiameter(100e6, env100M).diameter, 49.0);
+  assert.equal(mapBubbleDiameter(100e6, env1B).diameter, 49.0, '100M 气泡跨入 1B 包络后必须保持 49.0px，严禁跌落 35.7px');
+  assert.ok(Math.abs(mapBubbleDiameter(1.82e6, env1B).diameter - 33.6403) < 0.05);
+  assert.equal(mapBubbleDiameter(3.64e9, resolveScaleEnvelope(3.64e9, 'yearly')).diameter, 58.0);
+  assert.equal(mapBubbleDiameter(3.64e9, resolveScaleEnvelope(3.64e9, 'yearly')).overflow, true);
+
+  const dayBoundaries = [100e3, 1e6, 10e6, 100e6, 500e6];
+  const expectedDayCaps = [0.38 * 140, 0.52 * 140, 0.68 * 140, 0.84 * 140, 140];
+  dayBoundaries.forEach((b, idx) => {
+    const hLo = mapBarHeightPx(b - 1, resolveScaleEnvelope(b - 1, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).height;
+    const hAt = mapBarHeightPx(b, resolveScaleEnvelope(b, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).height;
+    const hHi = mapBarHeightPx(b + 1, resolveScaleEnvelope(b + 1, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).height;
+    assert.ok(Math.abs(hAt - expectedDayCaps[idx]) < 1e-6);
+    assert.ok(hLo <= hAt && hAt <= hHi, `日柱边界 ${b}: ${hLo} <= ${hAt} <= ${hHi} 不得跨档缩小`);
+    assert.equal(
+      mapBarHeightPx(1.82e6, resolveScaleEnvelope(b - 1, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).height,
+      mapBarHeightPx(1.82e6, resolveScaleEnvelope(b + 1, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).height
+    );
+  });
+  assert.equal(mapBarHeightPx(800e6, resolveScaleEnvelope(800e6, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).height, 140);
+  assert.equal(mapBarHeightPx(800e6, resolveScaleEnvelope(800e6, 'dailyBar'), 140, { scaleKind: 'dailyBar' }).overflow, true);
+
+  const weekBoundaries = [400e3, 4e6, 40e6, 400e6, 2e9];
+  const expectedWeekCaps = [0.38 * 96, 0.52 * 96, 0.68 * 96, 0.84 * 96, 96];
+  weekBoundaries.forEach((b, idx) => {
+    const hLo = mapBarHeightPx(b - 1, resolveScaleEnvelope(b - 1, 'weekly'), 96, { minPx: 3.0, scaleKind: 'weekly' }).height;
+    const hAt = mapBarHeightPx(b, resolveScaleEnvelope(b, 'weekly'), 96, { minPx: 3.0, scaleKind: 'weekly' }).height;
+    const hHi = mapBarHeightPx(b + 1, resolveScaleEnvelope(b + 1, 'weekly'), 96, { minPx: 3.0, scaleKind: 'weekly' }).height;
+    assert.ok(Math.abs(hAt - expectedWeekCaps[idx]) < 1e-6);
+    assert.ok(hLo <= hAt && hAt <= hHi, `周柱边界 ${b}: ${hLo} <= ${hAt} <= ${hHi} 不得跨档缩小`);
+  });
+  assert.equal(mapBarHeightPx(3.64e9, resolveScaleEnvelope(3.64e9, 'weekly'), 96, { minPx: 3.0, scaleKind: 'weekly' }).overflow, true);
+
+  // 2. 堆叠柱 1.5px 微段保底 & 严格总和恒等 & 原始百分比不被保底篡改
+  const barMixedH = mapBarHeightPx(100e6 + 100, resolveScaleEnvelope(100e6 + 100, 'dailyBar'), 140).height;
+  const allocated = allocateStackedSegmentHeights([
+    { key: 'major', value: 100e6 },
+    { key: 'tinyA', value: 100 },
+    { key: 'tinyB', value: 500 },
+    { key: 'zeroC', value: 0 }
+  ], barMixedH, 1.5);
+  assert.equal(allocated[1].heightPx, 1.5);
+  assert.equal(allocated[2].heightPx, 1.5);
+  assert.equal(allocated[3].heightPx, 0);
+  const segSum = allocated.reduce((acc, s) => acc + s.heightPx, 0);
+  assert.ok(Math.abs(segSum - barMixedH) < 1e-9);
+  assert.ok(allocated[1].rawRatio < 0.00001);
+
+  // 3. 连续 HSL 插值 & 双门槛峰值
+  const stops = ['#2E1A47', '#6D28D9', '#9333EA', '#D8B4FE'];
+  const c18 = interpolateScaleColorHsl(computeColorScaleResponse(18e6, 'yearly'), stops);
+  const c29 = interpolateScaleColorHsl(computeColorScaleResponse(29e6, 'yearly'), stops);
+  assert.notEqual(c18, c29);
+  assert.equal(shouldShowYearlyPeakBadge([1.82e6, 0, 0]), false);
+  assert.equal(shouldShowYearlyPeakBadge([100, 10e6, 0]), true);
+
+  // 4. 累计总量 A+C 核心算法验证：30 天含 0 用量与相邻高峰合并 + 最短 >=50% 集中区间 + 不足 7 天 + >90 天分周 + 0 空态 + log 尺
+  const dm30 = {};
+  const zeroDates = new Set(['2026-10-24', '2026-11-02', '2026-11-08', '2026-11-09']);
+  const peakMap = { '2026-10-29': 620e6, '2026-10-30': 710e6, '2026-10-31': 580e6 };
+  const sMs = Date.UTC(2026, 9, 20);
+  for (let i = 0; i < 30; i++) {
+    const d = new Date(sMs + i * 86400000);
+    const k = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    if (zeroDates.has(k)) continue;
+    const tok = peakMap[k] || (i >= 7 && i <= 12 ? 220e6 : 100e6);
+    dm30[k] = { total: tok, input: tok * 0.1, cache: tok * 0.85, output: tok * 0.05 };
+  }
+  const cum30 = computeCumulativeStripSummary(dm30, '2026-10-20', '2026-11-18');
+  assert.equal(cum30.totalDays, 30);
+  assert.equal(cum30.activeDays, 26);
+  assert.equal(cum30.zeroDays, 4);
+  assert.equal(cum30.grouping, 'daily');
+  assert.equal(cum30.peakDay.date, '2026-10-30');
+  assert.equal(cum30.mergedPeakSpans.length, 1, '10.29-10.31 连续前 3 高峰应合并为一个高亮区间');
+  assert.equal(cum30.mergedPeakSpans[0].startDate, '2026-10-29');
+  assert.equal(cum30.mergedPeakSpans[0].endDate, '2026-10-31');
+  const widthSum = cum30.segments.reduce((acc, s) => acc + s.stripWidthPct, 0);
+  assert.ok(Math.abs(widthSum - 100) < 1e-6);
+  assert.equal(cum30.dailyEntries[29].cumulativeTokens, cum30.intervalTotal);
+  assert.ok(cum30.concentration && cum30.concentration.sharePct >= 50);
+
+  // 并列最短 50% 集中区间必须取最早区间
+  const dmTie = {
+    '2026-11-01': { total: 250 },
+    '2026-11-02': { total: 250 },
+    '2026-11-03': { total: 0 },
+    '2026-11-04': { total: 0 },
+    '2026-11-05': { total: 250 },
+    '2026-11-06': { total: 250 },
+    '2026-11-07': { total: 0 }
+  };
+  const cumTie = computeCumulativeStripSummary(dmTie, '2026-11-01', '2026-11-07');
+  assert.equal(cumTie.concentration.startDate, '2026-11-01');
+  assert.equal(cumTie.concentration.endDate, '2026-11-02');
+  assert.equal(cumTie.concentration.daysCount, 2);
+
+  // 3 天记录不足 7 天：保留峰值，省略集中度
+  const cum3d = computeCumulativeStripSummary(
+    { '2026-11-17': { total: 1000 }, '2026-11-18': { total: 5000 }, '2026-11-19': { total: 6500 } },
+    '2026-11-17',
+    '2026-11-19'
+  );
+  assert.equal(cum3d.totalDays, 3);
+  assert.equal(cum3d.concentration, null);
+  assert.equal(cum3d.concentrationOmittedReason, 'insufficient_days');
+  assert.equal(cum3d.peakDay.date, '2026-11-19');
+  assert.equal(cum3d.ruler.status, 'below_min');
+
+  // 0 总量防除零 & 超 100B 量级尺
+  const cumEmpty = computeCumulativeStripSummary({}, '2026-11-01', '2026-11-10');
+  assert.equal(cumEmpty.intervalTotal, 0);
+  assert.equal(cumEmpty.ruler.status, 'zero');
+  assert.equal(computeLogRulerPosition(150e9).status, 'above_max');
+  assert.equal(computeLogRulerPosition(150e9).pct, 100);
+
+  // 超过 90 天自动按起点每 7 天分组
+  const cumLong = computeCumulativeStripSummary(dm30, '2026-07-01', '2026-11-18');
+  assert.equal(cumLong.grouping, 'weekly');
+  assert.ok(cumLong.segments.length >= 20 && cumLong.segments[0].days.length === 7);
+});
+
+test('Orchestrator & GetAvailableModels resolution: maps M667/M681/gemini-flash-worker-agy cleanly without raw placeholders', () => {
+  const {
+    resolveModelUsageBucket,
+    summarizeModelUsageWindow,
+    getModelChartColor
+  } = require('./meter-core');
+
+  const configs = [
+    { modelId: 'MODEL_PLACEHOLDER_M667', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M667' }, label: 'Orchestrator (Carbon)' },
+    { modelId: 'MODEL_PLACEHOLDER_M681', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M681' }, label: 'Orchestrator (Argon)' }
+  ];
+  const availDetails = {
+    'gemini-flash-worker-agy': { modelId: 'MODEL_PLACEHOLDER_M669', displayName: 'Gemini 4 Hydrogen (Orchestrator)' },
+    model_placeholder_m669: { modelId: 'MODEL_PLACEHOLDER_M669', displayName: 'Gemini 4 Hydrogen (Orchestrator)' },
+    'gemini-pro-orchestrator': { modelId: 'MODEL_PLACEHOLDER_M667', displayName: 'Orchestrator (Carbon)' },
+    model_placeholder_m667: { modelId: 'MODEL_PLACEHOLDER_M667', displayName: 'Orchestrator (Carbon)' },
+    'gemini-future-worker': { modelId: 'MODEL_PLACEHOLDER_M999', displayName: 'Gemini 4 Hydrogen (XHigh)' }
+  };
+
+  const workerDyn = resolveModelUsageBucket({ model: 'gemini-flash-worker-agy' }, configs, availDetails);
+  assert.equal(workerDyn.modelKey, 'gemini-4-hydrogen');
+  assert.equal(workerDyn.modelLabel, 'Gemini 4 Hydrogen');
+  assert.equal(workerDyn.variantKey, 'gemini-4-hydrogen:orchestrator');
+  assert.equal(workerDyn.variantLabel, 'Gemini 4 Hydrogen (Orchestrator)');
+
+  const workerOffline = resolveModelUsageBucket({ model: 'gemini-flash-worker-agy' });
+  assert.equal(workerOffline.modelKey, 'gemini-4-hydrogen');
+  assert.equal(workerOffline.variantKey, 'gemini-4-hydrogen:orchestrator');
+  assert.equal(workerOffline.variantLabel, 'Gemini 4 Hydrogen (Orchestrator)');
+
+  const m667Bucket = resolveModelUsageBucket({ model: 'MODEL_PLACEHOLDER_M667', modelLabel: 'MODEL_PLACEHOLDER_M667' }, configs, availDetails);
+  assert.equal(m667Bucket.modelKey, 'orchestrator');
+  assert.equal(m667Bucket.modelLabel, 'Orchestrator');
+  assert.equal(m667Bucket.variantKey, 'orchestrator:carbon');
+  assert.equal(m667Bucket.variantLabel, 'Orchestrator (Carbon)');
+
+  const orchOffline = resolveModelUsageBucket({ model: 'MODEL_PLACEHOLDER_M667' });
+  assert.equal(orchOffline.variantKey, 'orchestrator:carbon');
+  assert.equal(orchOffline.variantLabel, 'Orchestrator (Carbon)');
+
+  const cliOrchCarbon = resolveModelUsageBucket({ model: 'gemini-pro-orchestrator' }, configs, availDetails);
+  assert.equal(cliOrchCarbon.modelKey, 'orchestrator');
+  assert.equal(cliOrchCarbon.variantKey, 'orchestrator:carbon');
+  assert.equal(cliOrchCarbon.variantLabel, 'Orchestrator (Carbon)');
+
+  const orchArgon = resolveModelUsageBucket({ model: 'gemini-pro-orchestrator-argon' }, configs, availDetails);
+  assert.equal(orchArgon.modelKey, 'orchestrator');
+  assert.equal(orchArgon.variantKey, 'orchestrator:argon');
+  assert.equal(orchArgon.variantLabel, 'Orchestrator (Argon)');
+
+  const futureDyn = resolveModelUsageBucket({ model: 'MODEL_PLACEHOLDER_M999' }, configs, availDetails);
+  assert.equal(futureDyn.modelKey, 'gemini-4-hydrogen');
+  assert.equal(futureDyn.variantKey, 'gemini-4-hydrogen:xhigh');
+
+  assert.equal(getModelChartColor('orchestrator', 0, { theme: 'dark' }), '#f472b6');
+  assert.notEqual(getModelChartColor('orchestrator:carbon', 0, { theme: 'dark' }), getModelChartColor('orchestrator:argon', 1, { theme: 'dark' }));
+  assert.notEqual(getModelChartColor('gemini-4-hydrogen:orchestrator', 0, { theme: 'dark' }), getModelChartColor('gemini-4-hydrogen:xhigh', 1, { theme: 'dark' }));
+
+  const win = summarizeModelUsageWindow({
+    '2026-11-17': {
+      'orchestrator:carbon': { total: 500, input: 100, cache: 350, output: 50, steps: 2 },
+      'orchestrator:argon': { total: 300, input: 100, cache: 150, output: 50, steps: 1 },
+      'gemini-4-hydrogen:orchestrator': { total: 200, input: 50, cache: 100, output: 50, steps: 2 }
+    }
+  }, {
+    periodDays: 7,
+    endDate: '2026-11-18',
+    groupBy: 'model',
+    modelMetaByKey: {
+      'orchestrator:carbon': { modelKey: 'orchestrator', modelLabel: 'Orchestrator', variantKey: 'orchestrator:carbon', variantLabel: 'Orchestrator (Carbon)' },
+      'orchestrator:argon': { modelKey: 'orchestrator', modelLabel: 'Orchestrator', variantKey: 'orchestrator:argon', variantLabel: 'Orchestrator (Argon)' },
+      'gemini-4-hydrogen:orchestrator': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:orchestrator', variantLabel: 'Gemini 4 Hydrogen (Orchestrator)' }
+    }
+  });
+  assert.equal(win.legend.length, 2);
+  assert.equal(win.legend[0].label, 'Orchestrator');
+  assert.equal(win.legend[0].tokens, 800);
+  assert.equal(win.legend[1].label, 'Gemini 4 Hydrogen');
+  assert.equal(win.legend[1].tokens, 200);
+});
+
+test('PR #30 supplement: archive dirty key re-bucketing, existing modelExactId label backfill, worker IDs, and conservation', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { DatabaseSync } = require('node:sqlite');
+  const { resolveModelUsageBucket, lookupModelDisplayLabel } = require('./meter-core');
+  const { buildDailyModelBreakdown, needsDbLabelEnrichment, backfillMissingModelsFromConversationDb } = require('./meter-collector');
+
+  // 1. Worker / Orchestrator 显示名映射
+  assert.equal(lookupModelDisplayLabel({ model: 'gemini-flash-worker-agy' }), 'Gemini 4 Hydrogen (Orchestrator)');
+  assert.equal(lookupModelDisplayLabel({ modelExactId: 'MODEL_PLACEHOLDER_M669' }), 'Gemini 4 Hydrogen (Orchestrator)');
+  assert.equal(lookupModelDisplayLabel({ model: 'model_placeholder_m667' }), 'Orchestrator (Carbon)');
+  assert.equal(lookupModelDisplayLabel({ model: 'placeholder-m668' }), 'Orchestrator (Argon)');
+  assert.equal(lookupModelDisplayLabel({ model: 'placeholder-m681' }), 'Orchestrator (Argon)');
+  assert.equal(resolveModelUsageBucket({ model: 'MODEL_PLACEHOLDER_M668' }).variantLabel, 'Orchestrator (Argon)');
+
+  // 2. 旧归档脏 key 合并与总量守恒
+  const archiveV2 = {
+    modelMetaByKey: {
+      'placeholder-m402': { modelKey: 'placeholder-m402', modelLabel: 'placeholder-m402', variantKey: 'placeholder-m402', variantLabel: 'placeholder-m402' },
+      'gemini-flash-worker-agy': { modelKey: 'gemini-flash-worker-agy', modelLabel: 'gemini-flash-worker-agy', variantKey: 'gemini-flash-worker-agy', variantLabel: 'gemini-flash-worker-agy' },
+      'model_placeholder_m667': { modelKey: 'model_placeholder_m667', modelLabel: 'model_placeholder_m667', variantKey: 'model_placeholder_m667', variantLabel: 'model_placeholder_m667' },
+      'placeholder-m681': { modelKey: 'placeholder-m681', modelLabel: 'placeholder-m681', variantKey: 'placeholder-m681', variantLabel: 'placeholder-m681' }
+    },
+    dailyModelMapBySource: {
+      desktop: {
+        '2026-11-10': {
+          'placeholder-m402': { total: 1000, input: 300, cache: 600, output: 100, steps: 2 },
+          'claude-opus-5-5:high': { total: 500, input: 100, cache: 350, output: 50, steps: 1 },
+          'gemini-flash-worker-agy': { total: 800, input: 200, cache: 500, output: 100, steps: 3 },
+          'model_placeholder_m667': { total: 400, input: 100, cache: 250, output: 50, steps: 1 }
+        }
+      },
+      cli: {
+        '2026-11-10': {
+          'placeholder-m681': { total: 300, input: 80, cache: 180, output: 40, steps: 1 }
+        }
+      }
+    }
+  };
+  const breakdown = buildDailyModelBreakdown({
+    recentRequests: [],
+    finalCallsEntries: [],
+    matchedTranscriptReqs: new Set(),
+    matchedLedgerKeys: new Set(),
+    resolveLedgerCallDate: () => null,
+    mergedDesktop: { '2026-11-10': { total: 2700, input: 700, cache: 1700, output: 300, steps: 7 } },
+    mergedCli: { '2026-11-10': { total: 300, input: 80, cache: 180, output: 40, steps: 1 } },
+    mergedLegacyUnallocated: {},
+    archiveV2,
+    compactModelConfigs: [],
+    availableModelDetails: null
+  });
+
+  const dayAll = breakdown.dailyModelMapBySource.all['2026-11-10'];
+  assert.equal(dayAll['placeholder-m402'], undefined);
+  assert.equal(dayAll['gemini-flash-worker-agy'], undefined);
+  assert.equal(dayAll['model_placeholder_m667'], undefined);
+  assert.equal(dayAll['placeholder-m681'], undefined);
+  assert.deepEqual(dayAll['claude-opus-5-5:high'], { total: 1500, input: 400, cache: 950, output: 150, steps: 3 });
+  assert.deepEqual(dayAll['gemini-4-hydrogen:orchestrator'], { total: 800, input: 200, cache: 500, output: 100, steps: 3 });
+  assert.deepEqual(dayAll['orchestrator:carbon'], { total: 400, input: 100, cache: 250, output: 50, steps: 1 });
+  assert.deepEqual(dayAll['orchestrator:argon'], { total: 300, input: 80, cache: 180, output: 40, steps: 1 });
+
+  // 验证重新归类前后总量守恒
+  const sumVals = Object.values(dayAll).reduce((acc, r) => ({
+    total: acc.total + r.total,
+    input: acc.input + r.input,
+    cache: acc.cache + r.cache,
+    output: acc.output + r.output,
+    steps: acc.steps + r.steps
+  }), { total: 0, input: 0, cache: 0, output: 0, steps: 0 });
+  assert.deepEqual(sumVals, { total: 3000, input: 780, cache: 1880, output: 340, steps: 8 });
+  assert.equal(breakdown.modelMetaByKey['placeholder-m402'], undefined);
+  assert.equal(breakdown.modelMetaByKey['claude-opus-5-5:high'].variantLabel, 'Claude Opus 5.5 (High)');
+
+  // 3. 已有 modelExactId 但缺少 modelLabel 时触发 needsDbLabelEnrichment 并回填显示名
+  const recNeedLabel = {
+    tot: 500,
+    cascadeId: '66666666-6666-6666-6666-666666666666',
+    stepIndex: 1,
+    model: 'gemini-flash-worker-agy',
+    modelExactId: 'MODEL_PLACEHOLDER_M669',
+    ttftSec: 0.45,
+    streamingSec: 1.25
+  };
+  assert.equal(needsDbLabelEnrichment(recNeedLabel), true);
+  assert.equal(needsDbLabelEnrichment({ tot: 500, model: 'gemini-flash-worker-agy', modelLabel: 'Gemini 4 Hydrogen (Orchestrator)' }), false);
+
+  const encVarint = (n) => {
+    let v = BigInt(n >>> 0);
+    const out = [];
+    while (v >= 0x80n) { out.push(Number((v & 0x7fn) | 0x80n)); v >>= 7n; }
+    out.push(Number(v));
+    return Buffer.from(out);
+  };
+  const encLen = (f, buf) => {
+    const b = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf), 'utf8');
+    return Buffer.concat([encVarint((f << 3) | 2), encVarint(b.length), b]);
+  };
+  const encVi = (f, v) => Buffer.concat([encVarint((f << 3) | 0), encVarint(v)]);
+  const metaBlob = Buffer.concat([
+    encLen(1, Buffer.concat([encLen(19, 'gemini-flash-worker-agy'), encLen(21, 'Gemini 4 Hydrogen (Orchestrator)')])),
+    encVi(2, 1)
+  ]);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-pr30-db-'));
+  let db = null;
+  try {
+    const dbPath = path.join(tmpDir, `${recNeedLabel.cascadeId}.db`);
+    db = new DatabaseSync(dbPath);
+    db.exec('CREATE TABLE gen_metadata (data BLOB);');
+    db.prepare('INSERT INTO gen_metadata (data) VALUES (?)').run(metaBlob);
+    db.close();
+    db = null;
+
+    const filled = backfillMissingModelsFromConversationDb([recNeedLabel], tmpDir);
+    assert.equal(filled, 1);
+    assert.equal(recNeedLabel.modelLabel, 'Gemini 4 Hydrogen (Orchestrator)');
+    assert.equal(recNeedLabel.modelExactId, 'MODEL_PLACEHOLDER_M669');
+    assert.equal(recNeedLabel.ttftSec, 0.45);
+  } finally {
+    if (db) { try { db.close(); } catch {} }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.8.8 i18n/货币基础能力: 48国预设含完整 nameTw/nameEn 且无简体残留，支持 USD/HKD/TWD/CNY 互转与结构化 currentPeriod', () => {
+  const {
+    SUBSCRIPTION_REGIONS_PRESET,
+    findRegionPreset,
+    convertCurrency,
+    normalizeTokenHistoryPayload
+  } = require('./meter-core');
+  assert.ok(SUBSCRIPTION_REGIONS_PRESET.length >= 40);
+  const simpChars = /[国韩亚欧乌罗马联东陆区宾兰达尔义]/;
+  for (const r of SUBSCRIPTION_REGIONS_PRESET) {
+    assert.ok(r.nameEn && /^[ -~]+$/.test(r.nameEn), `preset ${r.id} missing pure ASCII nameEn: ${r.nameEn}`);
+    assert.ok(r.nameTw && r.nameTw.length > 0, `preset ${r.id} missing nameTw`);
+    assert.equal(simpChars.test(r.nameTw), false, `preset ${r.id} nameTw has simplified chars: ${r.nameTw}`);
+  }
+  assert.equal(findRegionPreset('United States (US)')?.id, 'US');
+  assert.equal(findRegionPreset('美國 (USD)')?.id, 'US');
+  assert.equal(findRegionPreset('Taiwan (TWD)')?.id, 'TW');
+
+  assert.equal(convertCurrency(10, 'USD', 'CNY'), 67.2);
+  assert.equal(convertCurrency(1, 'USD', 'TWD'), 32);
+  assert.equal(convertCurrency(1, 'USD', 'HKD'), Number((6.72 / 0.857).toFixed(2)));
+  assert.equal(convertCurrency(158, 'HKD', 'USD'), Number(((158 * 0.857) / 6.72).toFixed(2)));
+
+  const norm = normalizeTokenHistoryPayload({ dailyMap: {}, dailyMapBySource: { all: {}, desktop: {}, cli: {} } });
+  assert.equal(norm.currentPeriod.periodType, 'calendar_month');
+  assert.doesNotMatch(norm.currentPeriod.label, /[\u4e00-\u9fff]/);
+});
+
+test('Issue #41 & ELV-94 settings: selectPrimaryQuotaBucket supports auto/5h/weekly and dockPosition/quotaBadgeWindowMode persist safely', () => {
+  const { selectPrimaryQuotaBucket, resolveQuotaWindowBucketPair } = require('./meter-core');
+  const { getPluginSettings, savePluginSettings } = require('./meter-collector');
+  const buckets = [
+    { bucketId: 'b5h', windowKey: '5h', windowShort: '5h', remainingFraction: 0.92 },
+    { bucketId: 'b7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.64 }
+  ];
+  assert.equal(selectPrimaryQuotaBucket(buckets, 'auto').primaryBucket.windowShort, '7d');
+  assert.equal(selectPrimaryQuotaBucket(buckets, '5h').primaryBucket.windowShort, '5h');
+  assert.equal(selectPrimaryQuotaBucket(buckets, 'weekly').primaryBucket.windowShort, '7d');
+  const pair = resolveQuotaWindowBucketPair(buckets);
+  assert.equal(pair.bucket5h.remainingFraction, 0.92);
+  assert.equal(pair.bucket7d.remainingFraction, 0.64);
+
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-ui-prefs-'));
+  try {
+    const defSettings = getPluginSettings({ agDir: tmpDir });
+    assert.equal(defSettings.dockPosition, 'flow');
+    assert.equal(defSettings.quotaBadgeWindowMode, 'auto');
+
+    savePluginSettings({ dockPosition: 'aux', quotaBadgeWindowMode: 'both' }, { agDir: tmpDir });
+    const next = getPluginSettings({ agDir: tmpDir });
+    assert.equal(next.dockPosition, 'aux');
+    assert.equal(next.quotaBadgeWindowMode, 'both');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Issue #49: parseUserPlanStatus 自动提取 5x/20x 倍率子档与 resolveEffectivePlanStatus 手动覆盖', () => {
+  // 1. 服务端返回 5x 明确子档倍率（字符串）
+  const res5x = parseUserPlanStatus({
+    userStatus: {
+      userTier: { id: 'g1-ultra-5x-tier', name: 'Google AI Ultra 5x' }
+    }
+  });
+  assert.equal(res5x.tierKey, 'ultra');
+  assert.equal(res5x.tierName, 'Google AI Ultra 5x');
+  assert.equal(res5x.multiplier, 5);
+
+  // 2. 服务端返回 20x 明确子档倍率（数值 multiplier）
+  const res20x = parseUserPlanStatus({
+    userStatus: {
+      userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra', multiplier: 20 }
+    }
+  });
+  assert.equal(res20x.tierKey, 'ultra');
+  assert.equal(res20x.tierName, 'Google AI Ultra 20x');
+  assert.equal(res20x.multiplier, 20);
+
+  // 3. 用户手动选择覆盖：优先于服务端返回值
+  const effManual5x = resolveEffectivePlanStatus(res20x, {
+    planTierOverride: 'ultra_5x'
+  });
+  assert.equal(effManual5x.tierKey, 'ultra');
+  assert.equal(effManual5x.tierName, 'Google AI Ultra 5x');
+  assert.equal(effManual5x.multiplier, 5);
+  assert.equal(effManual5x.sources.tier, 'custom');
+
+  // 4. 手动覆盖为 Free / Pro / Ultra 20x
+  const effFree = resolveEffectivePlanStatus(res20x, { planTierOverride: 'free' });
+  assert.equal(effFree.tierKey, 'free');
+  assert.equal(effFree.tierName, 'Free');
+
+  const effPro = resolveEffectivePlanStatus(res20x, { planTierOverride: 'pro' });
+  assert.equal(effPro.tierKey, 'pro');
+  assert.equal(effPro.tierName, 'Google AI Pro');
+
+  // 5. 手动选择 auto 时，恢复以服务端返回为准
+  const effAuto = resolveEffectivePlanStatus(res20x, { planTierOverride: 'auto' });
+  assert.equal(effAuto.tierKey, 'ultra');
+  assert.equal(effAuto.tierName, 'Google AI Ultra 20x');
+  assert.equal(effAuto.multiplier, 20);
+  assert.equal(effAuto.sources.tier, 'live');
+});
+
+test('PR #37 核心遥测回归：cacheCreationInputTokens 归口、流式 warming 防抖与 summarizeTurnTiming 轮次墙钟拆解', () => {
+  const core = require('./meter-core');
+  // 1. summarize 正确纳 cacheCreationInputTokens 入 uncachedInput 与 totalInput，且输出不入缓存分母
+  const sumCache = core.summarize({
+    chatModel: {
+      model: 'claude-sonnet-5-5',
+      timeToFirstToken: '0.8s',
+      streamingDuration: '1.2s',
+      usage: {
+        inputTokens: 1000,
+        cacheCreationInputTokens: 3000,
+        cacheReadTokens: 6000,
+        outputTokens: 500
+      }
+    }
+  });
+  assert.equal(sumCache.input, 10000);
+  assert.equal(sumCache.uncachedInput, 4000);
+  assert.equal(sumCache.cacheWrite, 3000);
+  assert.equal(sumCache.cached, 6000);
+  assert.equal(sumCache.cacheHitRate, 60);
+  assert.equal(sumCache.actual, 10500);
+  assert.equal(sumCache.speed.phase, 'settled');
+  assert.equal(sumCache.speed.isWarmingStream, false);
+
+  // 2. 早期起流 (<0.45s 且 <12 tokens) 标记 warming 防抖
+  const sumWarm = core.summarize({
+    chatModel: {
+      model: 'gemini-4-hydrogen',
+      timeToFirstToken: '0.6s',
+      streamingDuration: '0.1s',
+      usage: { inputTokens: 200, outputTokens: 3 }
+    }
+  });
+  assert.equal(sumWarm.speed.phase, 'warming');
+  assert.equal(sumWarm.speed.isWarmingStream, true);
+  assert.equal(sumWarm.speed.displayTps, null);
+
+  // 3. summarizeTurnTiming 并发工具时间段合并去重与端到端墙钟拆解
+  const t0 = 1700000000000;
+  const timing = core.summarizeTurnTiming({
+    steps: [
+      { userInput: { text: 'run checks' }, metadata: { createdAt: new Date(t0).toISOString(), executionId: 'ex-1' } },
+      { metadata: { toolCall: { name: 'run1' }, startedAt: new Date(t0 + 2000).toISOString(), completedAt: new Date(t0 + 6000).toISOString(), executionId: 'ex-1' }, status: 'DONE' },
+      { metadata: { toolCall: { name: 'run2' }, startedAt: new Date(t0 + 3000).toISOString(), completedAt: new Date(t0 + 7000).toISOString(), executionId: 'ex-1' }, status: 'DONE' },
+      { plannerResponse: { text: 'done' }, metadata: { createdAt: new Date(t0 + 7500).toISOString(), completedAt: new Date(t0 + 10000).toISOString(), executionId: 'ex-1' }, status: 'DONE' }
+    ],
+    generatorMetadata: [
+      { executionId: 'ex-1', stepIndices: [3], chatModel: { timeToFirstToken: '1.0s', streamingDuration: '1.5s', usage: { outputTokens: 250 } } }
+    ],
+    cascadeStatus: 'CASCADE_RUN_STATUS_IDLE',
+    nowMs: t0 + 10000
+  });
+  assert.equal(timing.isRunning, false);
+  assert.equal(timing.toolWallSec, 5); // [2000,6000] U [3000,7000] = 5s
+  assert.equal(timing.llmDurationSec, 2.5);
+  assert.equal(timing.wallDurationSec, 10);
+  assert.equal(timing.scheduleGapSec, 2.5); // 10 - 2.5 - 5 = 2.5
+  assert.equal(timing.endToEndTps, 25);
+
+  const collectorMod = require('./meter-collector');
+  assert.equal(typeof collectorMod.collectTurnState, 'function');
+});
+
+test('/compact & checkpoint 核心因果判定：检查点切片、摘要调用隔离、宿主 ContextWindowUsage 优先级与超限报错自救恢复', () => {
+  const {
+    analyzeSteps,
+    measure,
+    isCheckpointNewerThanGenerator,
+    buildPostCompactSummary,
+    summarize
+  } = require('./meter-core');
+
+  const overflowErr = {
+    errorMessage: {
+      error: { shortError: 'The input token count exceeds the maximum number of tokens allowed 256000.' }
+    }
+  };
+
+  // 1. 超限报错后紧跟成功的 checkpoint -> 自动清除旧超限报错，并准确切片检查点及后续内容
+  const stepsAfterCompact = [
+    { userInput: { userResponse: 'x'.repeat(40000), media: [{ uri: 'file:///old.txt', mimeType: 'text/plain' }] } },
+    { plannerResponse: { response: 'y'.repeat(40000), thinking: 't'.repeat(10000) } },
+    overflowErr,
+    {
+      checkpoint: {
+        sessionSummary: 'Summary of prior 80K chars',
+        codeChangeSummary: 'Edited foo.js',
+        userIntent: 'Fix ring sync after compact'
+      }
+    }
+  ];
+  const s1 = analyzeSteps(stepsAfterCompact);
+  assert.equal(s1.checkpointCount, 1);
+  assert.equal(s1.lastCheckpointIndex, 3);
+  assert.equal(s1.lastCheckpointFailed, false);
+  assert.equal(s1.currentError, null, '成功的检查点应清除此前的超限错误');
+  assert.ok(s1.postCheckpoint, '应生成压缩后活跃切片');
+  assert.deepEqual(s1.postCheckpoint.mediaRefs, {}, '检查点之前的旧附件引用不应计入压缩后窗口');
+  assert.ok(s1.postCheckpoint.textTotal.chars < 200, '压缩后切片仅包含检查点摘要文本，不包含前序 80K 历史');
+  assert.ok(s1.total.chars > 80000, '全量累计统计仍完整保留整场历史');
+
+  // 2. 失败的 checkpoint (modelSummarizationFailed: true) 不清除前序超限报错
+  const stepsFailedCompact = [
+    { userInput: { userResponse: 'hello' } },
+    overflowErr,
+    { checkpoint: { sessionSummary: '', modelSummarizationFailed: true } }
+  ];
+  const sFail = analyzeSteps(stepsFailedCompact);
+  assert.equal(sFail.checkpointCount, 0);
+  assert.equal(sFail.lastCheckpointIndex, -1);
+  assert.equal(sFail.lastCheckpointFailed, true);
+  assert.ok(sFail.currentError, '摘要生成失败时必须保留前序超限错误');
+
+  // 3. 检查点之后再次发生的新错误仍正常保留
+  const sPostErr = analyzeSteps([...stepsAfterCompact, overflowErr]);
+  assert.ok(sPostErr.currentError, '检查点之后新发生的错误必须正常告警');
+
+  // 4. 因果时序判定：压缩前旧调用 (step 1) 与摘要生成调用本身 (step 3 === checkpointIndex) 均判定为压缩态
+  const preMeta = {
+    stepIndices: [1],
+    chatModel: {
+      modelDisplayName: 'Gemini 4 Carbon (High)',
+      usage: { inputTokens: 195000, outputTokens: 2000 },
+      chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
+    }
+  };
+  const summarizerMeta = {
+    stepIndices: [3],
+    chatModel: {
+      modelDisplayName: 'Gemini 3.8 Flash',
+      usage: { inputTokens: 197000, outputTokens: 1200 }
+    }
+  };
+  assert.equal(isCheckpointNewerThanGenerator(s1, preMeta, summarize(preMeta)), true);
+  assert.equal(isCheckpointNewerThanGenerator(s1, summarizerMeta, summarize(summarizerMeta)), true);
+
+  // 5. 本地兜底中位值 vs 宿主 ContextWindowUsage 优先级
+  const sysM = measure('System instructions '.repeat(200));
+  const defM = measure('Tool definitions '.repeat(200));
+  const localPost = buildPostCompactSummary({
+    session: s1,
+    system: sysM,
+    definitions: defM,
+    previousLatest: summarize(preMeta)
+  });
+  assert.equal(localPost.compacted, true);
+  assert.equal(localPost.status, 'compacted');
+  assert.equal(localPost.actual, null, '压缩后待校准态严禁伪造服务端实测 actual');
+  assert.equal(localPost.postCompactSource, 'local_post_checkpoint_midpoint');
+  assert.equal(localPost.budget, 256000);
+  assert.ok(localPost.postCompactEstimate > 0 && localPost.postCompactEstimate < 10000);
+  assert.equal(localPost.percent, (localPost.postCompactEstimate / 256000) * 100);
+
+  const hostPost = buildPostCompactSummary({
+    session: s1,
+    system: sysM,
+    definitions: defM,
+    previousLatest: summarize(preMeta),
+    hostContextWindowUsage: {
+      estimatedTokensUsed: 18432,
+      maxContextTokens: 256000,
+      lastStepIndex: 3,
+      estimatedAfterCompaction: true
+    }
+  });
+  assert.equal(hostPost.postCompactSource, 'host_context_window_usage');
+  assert.equal(hostPost.postCompactEstimate, 18432);
+  assert.equal(hostPost.percent, (18432 / 256000) * 100);
+
+  // 6. 检查点之后产生新对话实测 (step 5 > 3) -> 自动退出压缩态
+  const nextTurnMeta = {
+    stepIndices: [5],
+    chatModel: {
+      modelDisplayName: 'Gemini 4 Carbon (High)',
+      usage: { inputTokens: 19200, outputTokens: 600 },
+      chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
+    }
+  };
+  assert.equal(isCheckpointNewerThanGenerator(s1, nextTurnMeta, summarize(nextTurnMeta)), false);
+
+  // 7. 进行中 (RUNNING) 与已取消 (CANCELED) 的 checkpoint 步骤状态隔离：不提前覆盖旧检查点基线
+  const runningSteps = [
+    ...stepsAfterCompact,
+    { userInput: { userResponse: '二次对话输入' } },
+    { plannerResponse: { modifiedResponse: '二次对话回复' } },
+    { userInput: { userResponse: '/compact' } },
+    { status: 'CORTEX_STEP_STATUS_RUNNING', checkpoint: { sessionSummary: '' } }
+  ];
+  const sRunning = analyzeSteps(runningSteps);
+  assert.equal(sRunning.lastCheckpointIndex, 3, 'RUNNING 状态的摘要检查点未落盘前不得提前推进 lastCheckpointIndex');
+  assert.equal(sRunning.inProgressCheckpointIndex, 7, '应准确暴露进行中的 checkpoint 步序');
+  assert.equal(sRunning.checkpointCount, 1);
+
+  const canceledSteps = [
+    ...stepsAfterCompact,
+    { status: 'CORTEX_STEP_STATUS_CANCELED', checkpoint: { sessionSummary: '' } }
+  ];
+  const sCanceled = analyzeSteps(canceledSteps);
+  assert.equal(sCanceled.lastCheckpointIndex, 3);
+  assert.equal(sCanceled.lastCheckpointFailed, true);
+  assert.equal(sCanceled.inProgressCheckpointIndex, -1);
+});
+
+test('ELV-95: detectContextChangeEvents 准确识别五类上下文变化事件及前后 Token', () => {
+  const { detectContextChangeEvents } = require('./meter-core');
+  const steps = [
+    { userInput: { userResponse: 'initial prompt', media: [{ uri: 'file:///a.md', bytes: 4000 }] }, createdAt: '2026-11-22T01:00:00Z' },
+    { plannerResponse: { response: 'ok' }, createdAt: '2026-11-22T01:00:05Z' },
+    { checkpoint: { sessionSummary: 'compact summary' }, createdAt: '2026-11-22T01:01:00Z' },
+    { systemMessage: { systemMessage: '[POST-COMPACT REHYDRATION v1] ' + 'x'.repeat(1600) }, createdAt: '2026-11-22T01:01:10Z' },
+    { prune: { beforeTokens: 48000, afterTokens: 22000, reason: 'tool_trim' }, createdAt: '2026-11-22T01:02:00Z' },
+    { modeChange: { from: 'planning', to: 'execution' }, createdAt: '2026-11-22T01:03:00Z' },
+    { modelChange: { from: 'Gemini 4 Carbon', to: 'Gemini 4 Hydrogen' }, createdAt: '2026-11-22T01:04:00Z' }
+  ];
+  const calls = [
+    { callId: 'c1', stepIndex: 1, timestamp: Date.parse('2026-11-22T01:00:05Z'), modelExactId: 'gemini-4-carbon-high', modelLabel: 'Gemini 4 Carbon (High)', effort: 'High', inputTokens: 120000, totalInputTokens: 120000 },
+    { callId: 'c2', stepIndex: 3, timestamp: Date.parse('2026-11-22T01:01:12Z'), modelExactId: 'gemini-4-carbon-high', modelLabel: 'Gemini 4 Carbon (High)', effort: 'High', inputTokens: 14500, totalInputTokens: 14500 },
+    { callId: 'c3', stepIndex: 7, timestamp: Date.parse('2026-11-22T01:04:10Z'), modelExactId: 'gemini-4-hydrogen-low', modelLabel: 'Gemini 4 Hydrogen (Low)', effort: 'Low', inputTokens: 16200, totalInputTokens: 16200 }
+  ];
+  const events = detectContextChangeEvents(steps, calls);
+  const types = new Set(events.map(e => e.type));
+  assert.equal(types.has('compaction'), true, '应识别 compaction');
+  assert.equal(types.has('inject'), true, '应识别 inject');
+  assert.equal(types.has('prune'), true, '应识别 prune');
+  assert.equal(types.has('mode'), true, '应识别 mode');
+  assert.equal(types.has('model'), true, '应识别 model');
+  const cpEv = events.find(e => e.type === 'compaction');
+  assert.equal(cpEv.beforeTokens, 120000);
+  assert.equal(cpEv.afterTokens, 14500);
+  assert.equal(cpEv.deltaTokens, 14500 - 120000);
+  const injEv = events.find(e => e.type === 'inject' && e.stepIndex === 3);
+  assert.ok(injEv && injEv.deltaTokens > 100);
+  const prEv = events.find(e => e.type === 'prune');
+  assert.equal(prEv.beforeTokens, 48000);
+  assert.equal(prEv.afterTokens, 22000);
+});
+
+test('会话深度剖析: analyzeSteps 细分注入/技能, 命令行脱敏与逐轮/耗时/主子防重汇总', () => {
+  const {
+    analyzeSteps,
+    buildSessionCompositionBreakdown,
+    sanitizeCommandPreview,
+    extractCommandProgram,
+    groupSessionCallsByTurns
+  } = require('./meter-core');
+
+  const steps = [
+    { type: 'SYSTEM_MESSAGE', systemMessage: { content: '<RULE[AGENTS.md]> keep clean ' + 'x'.repeat(200) } },
+    { userInput: { userResponse: '请检查 <skills>gdrive</skills> 并执行修复' } },
+    { tool_calls: [{ name: 'read_file', args: { Path: '"C:/Users/demo/.gemini/skills/gdrive/SKILL.md"' } }], generic: { ok: true, content: 'skill body '.repeat(30) } },
+    { plannerResponse: { response: '完成', thinking: '分析完成' } }
+  ];
+  const analyzed = analyzeSteps(steps);
+  assert.ok(analyzed.compositionSubgroups);
+  assert.ok(analyzed.compositionSubgroups.injectionCount >= 1, '应识别系统/规则注入');
+  assert.ok(analyzed.compositionSubgroups.injections.chars > 100);
+  assert.ok(analyzed.compositionSubgroups.skillCount >= 1, '应识别 SKILL 加载');
+  assert.ok(analyzed.compositionSubgroups.skills.chars > 10);
+
+  const comp = buildSessionCompositionBreakdown(analyzed, { actual: 1850 });
+  assert.ok(Array.isArray(comp.items));
+  assert.equal(comp.items.find(x => x.key === 'injections').count, analyzed.compositionSubgroups.injectionCount);
+  assert.equal(comp.actualTokens, 1850);
+  assert.equal(comp.diffTokens, 1850 - comp.estimatedTotalMedian);
+
+  const rawCmd = 'cd "D:/proj" && GCLI_ACCESS_TOKEN=ya29.secret_abc123456 node cli.js --token sk-test999999999 --api-key=secretXYZ https://x.dev?access_token=abc123';
+  const safeCmd = sanitizeCommandPreview(rawCmd);
+  assert.equal(safeCmd.includes('ya29.secret_abc123456'), false);
+  assert.equal(safeCmd.includes('sk-test999999999'), false);
+  assert.equal(safeCmd.includes('secretXYZ'), false);
+  assert.equal(safeCmd.includes('abc123'), false);
+  assert.equal(extractCommandProgram('cd /app && AGY_ACCOUNT=work pwsh -NoProfile -File run.ps1'), 'pwsh');
+
+  const t1Calls = [
+    {
+      callId: 'c1', stepIndex: 1, timestamp: 1000000, model: 'gemini-4',
+      inputTokens: 10000, cacheReadTokens: 0, outputTokens: 200,
+      ttftSec: 1.2, streamingSec: 4.0, durationSec: 5.2
+    },
+    {
+      callId: 'c2', stepIndex: 3, timestamp: 1012000, model: 'gemini-4',
+      inputTokens: 2000, cacheReadTokens: 16000, outputTokens: 300,
+      ttftSec: 0.8, streamingSec: 6.0, durationSec: 6.8
+    },
+    {
+      callId: 'sub1', cascadeId: 'child-1', agentRole: 'subagent', parentStepIndex: 2,
+      subagentType: 'research', attributionConfidence: 'verified_tool_output',
+      stepIndex: 0, timestamp: 1005000, model: 'gemini-4-flash',
+      inputTokens: 1500, cacheReadTokens: 500, outputTokens: 100,
+      ttftSec: 0.5, streamingSec: 1.5, durationSec: 2.0
+    }
+  ];
+  const grouped = groupSessionCallsByTurns(
+    [{ stepIndex: 0, timestamp: 999000, preview: 'turn 1' }, { stepIndex: 3, timestamp: 1011000, preview: 'turn 2' }],
+    t1Calls,
+    { cascadeId: 'main-1', toolExecEvents: [{ stepIndex: 2, durationSec: 3.5 }] }
+  );
+  assert.equal(grouped.contextDeltaSummary.initialContextTokens, 10000);
+  assert.equal(grouped.contextDeltaSummary.latestContextTokens, 18000);
+  assert.equal(grouped.contextDeltaSummary.netDeltaTokens, 8000);
+  assert.equal(grouped.contextDeltaSummary.maxJumpCallId, 'c2');
+  assert.equal(grouped.contextDeltaSummary.maxJumpDeltaTokens, 8000);
+  assert.equal(grouped.turns[1].deltaFromPrevTurn, 8000);
+  assert.equal(grouped.timingSummary.totalTtftSec, 2.5);
+  assert.equal(grouped.timingSummary.totalStreamingSec, 11.5);
+  assert.equal(grouped.timingSummary.totalToolExecSec, 3.5);
+  assert.equal(grouped.agentFleetSummary.dedupVerified, true);
+  assert.equal(grouped.agentFleetSummary.mainAgent.callCount, 2);
+  assert.equal(grouped.agentFleetSummary.subagents.length, 1);
+  assert.equal(grouped.agentFleetSummary.mainOnlyTotalTokens, 28500);
+  assert.equal(grouped.agentFleetSummary.fleetCombinedTotalTokens, 30600);
+});
+
+test('evaluateSessionRuntimeStatus: 4 态转换与跨模型压缩 / 重试 / 断连 / 用户取消判定', () => {
+  const { evaluateSessionRuntimeStatus, computeContextSegments, groupSessionCallsByTurns } = require('./meter-core');
+
+  assert.equal(evaluateSessionRuntimeStatus({}).state, 'idle');
+  assert.equal(evaluateSessionRuntimeStatus({ isGenerating: true, waitSec: 12 }).state, 'running');
+  assert.equal(evaluateSessionRuntimeStatus({ isGenerating: true, waitSec: 65 }).state, 'slow');
+
+  const crossCompact = evaluateSessionRuntimeStatus({ isCompacting: true, compactCrossModel: true });
+  assert.equal(crossCompact.state, 'slow');
+  assert.equal(crossCompact.reasonCode, 'compact_kv_recompute');
+  assert.match(crossCompact.detail, /KV 缓存重算/);
+
+  const retrySt = evaluateSessionRuntimeStatus({ retryAttempt: 2, retryCountdownSec: 8 });
+  assert.equal(retrySt.state, 'slow');
+  assert.equal(retrySt.reasonCode, 'retrying');
+
+  assert.equal(evaluateSessionRuntimeStatus({ disconnectedSec: 5 }).state, 'slow');
+  assert.equal(evaluateSessionRuntimeStatus({ disconnectedSec: 15 }).state, 'error');
+  assert.equal(evaluateSessionRuntimeStatus({ isOffline: true }).state, 'error');
+  assert.equal(evaluateSessionRuntimeStatus({ lastError: '502 Bad Gateway' }).state, 'error');
+  assert.equal(evaluateSessionRuntimeStatus({ lastError: 'User canceled', isUserCanceled: true }).state, 'idle');
+
+  const segWarn = computeContextSegments({ inputTokens: 20000, cacheCreationInputTokens: 5000, cacheReadTokens: 135000, outputTokens: 2000 }, 200000);
+  assert.equal(segWarn.hasCacheWrite, true);
+  assert.equal(segWarn.usedPct, 81);
+  assert.equal(segWarn.thresholdLevel, 'warning');
+  assert.equal(segWarn.remainingTokens, 38000);
+
+  const segCrit = computeContextSegments({ actual: 185000 }, 200000);
+  assert.equal(segCrit.hasSplit, false);
+  assert.equal(segCrit.thresholdLevel, 'critical');
+
+  const groupedCollab = groupSessionCallsByTurns(
+    [{ stepIndex: 0, timestamp: 1000, preview: 'run' }],
+    [{ callId: 'c-main', stepIndex: 1, inputTokens: 100, cacheReadTokens: 50, outputTokens: 20, timestamp: 2000 }],
+    {
+      cascadeId: 'sess-x',
+      taskEvents: [{ stepIndex: 2, toolName: 'manage_task', role: 'planner', summary: 'update task', status: 'completed', timestamp: 3000 }]
+    }
+  );
+  assert.equal(groupedCollab.agentFleetSummary.hasTaskDependencyDag, false);
+  assert.equal(groupedCollab.agentFleetSummary.taskEvents.length, 1);
+  assert.equal(groupedCollab.agentFleetSummary.collaborationTimeline.length, 2);
+  assert.equal(groupedCollab.agentFleetSummary.collaborationTimeline[0].kind, 'main_call');
+  assert.equal(groupedCollab.agentFleetSummary.collaborationTimeline[1].kind, 'task_event');
+});
+
+test('PR #36 图像解析性能：WebP (VP8 / VP8L / VP8X) 尺寸识别与内联图片元信息缓存命中', async () => {
+  const { scanFiles, getImageDimensions, inspectInlineImageMeta, INLINE_IMAGE_DIMS_CACHE } = require('./meter-collector');
+
+  const makeWebpVp8 = (width, height) => {
+    const buf = Buffer.alloc(30, 0);
+    buf.write('RIFF', 0, 'ascii');
+    buf.writeUInt32LE(22, 4);
+    buf.write('WEBP', 8, 'ascii');
+    buf.write('VP8 ', 12, 'ascii');
+    buf.writeUInt32LE(10, 16);
+    buf[20] = 0x10;
+    buf[23] = 0x9D;
+    buf[24] = 0x01;
+    buf[25] = 0x2A;
+    buf.writeUInt16LE(width & 0x3FFF, 26);
+    buf.writeUInt16LE(height & 0x3FFF, 28);
+    return buf;
+  };
+
+  const makeWebpVp8L = (width, height) => {
+    const buf = Buffer.alloc(25, 0);
+    buf.write('RIFF', 0, 'ascii');
+    buf.writeUInt32LE(17, 4);
+    buf.write('WEBP', 8, 'ascii');
+    buf.write('VP8L', 12, 'ascii');
+    buf.writeUInt32LE(5, 16);
+    buf[20] = 0x2F;
+    const packed = (((height - 1) & 0x3FFF) << 14) | ((width - 1) & 0x3FFF);
+    buf.writeUInt32LE(packed >>> 0, 21);
+    return buf;
+  };
+
+  const makeWebpVp8X = (width, height) => {
+    const buf = Buffer.alloc(30, 0);
+    buf.write('RIFF', 0, 'ascii');
+    buf.writeUInt32LE(22, 4);
+    buf.write('WEBP', 8, 'ascii');
+    buf.write('VP8X', 12, 'ascii');
+    buf.writeUInt32LE(10, 16);
+    buf.writeUIntLE(width - 1, 24, 3);
+    buf.writeUIntLE(height - 1, 27, 3);
+    return buf;
+  };
+
+  assert.deepEqual(getImageDimensions(makeWebpVp8(1280, 720)), { width: 1280, height: 720 });
+  assert.deepEqual(getImageDimensions(makeWebpVp8L(800, 600)), { width: 800, height: 600 });
+  assert.deepEqual(getImageDimensions(makeWebpVp8X(1920, 1080)), { width: 1920, height: 1080 });
+  assert.deepEqual(getImageDimensions(Buffer.from('RIFF\x00\x00\x00\x00WEBP', 'ascii')), { width: null, height: null });
+
+  INLINE_IMAGE_DIMS_CACHE.clear();
+  const bigPng = Buffer.alloc(2048, 0);
+  bigPng[0] = 0x89; bigPng[1] = 0x50; bigPng[2] = 0x4E; bigPng[3] = 0x47;
+  bigPng.writeUInt32BE(1536, 16);
+  bigPng.writeUInt32BE(768, 20);
+  const b64Png = bigPng.toString('base64');
+
+  const first = inspectInlineImageMeta('inline:webp-test-1', 'image/png', b64Png);
+  assert.equal(first.cacheHit, false);
+  assert.equal(first.width, 1536);
+  assert.equal(first.height, 768);
+  assert.equal(first.bytes, 2048);
+
+  const second = inspectInlineImageMeta('inline:webp-test-1', 'image/png', b64Png);
+  assert.equal(second.cacheHit, true);
+  assert.equal(second.width, 1536);
+
+  const webpB64 = makeWebpVp8L(1024, 768).toString('base64');
+  const [info] = await scanFiles([{ uri: 'inline:webp-1', mime: 'image/webp', inlineData: webpB64 }]);
+  assert.equal(info.status, 'parsed');
+  assert.equal(info.dimensions, '1024×768');
+  assert.ok(info.low >= 258 * 2);
+});
+
+test('PR #36 JSONL 增量扫描边界：UTF-8 跨字节截断、无换行尾行、追加、截断、同大小覆写、轮换、只读与账号隔离', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { loadIncrementalTranscriptRecords, collectTokenHistoryAsync } = require('./meter-collector');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-pr36-incr-full-'));
+  const cacheMap = new Map();
+  try {
+    const cid = '55555555-6666-4777-8888-999999999999';
+    const convDir = path.join(tmpDir, 'acctA', 'brain', cid, '.system_generated', 'logs');
+    fs.mkdirSync(convDir, { recursive: true });
+    const filePath = path.join(convDir, 'transcript.jsonl');
+
+    const prefixLines = [];
+    for (let p = 0; p < 6; p++) {
+      prefixLines.push(JSON.stringify({
+        type: 'PLANNER_RESPONSE',
+        created_at: `2026-11-20T07:5${p}:00Z`,
+        step_index: p,
+        model: 'gemini-3.8-flash',
+        input_tokens: 100 + p,
+        output_tokens: 10,
+        cache_read_tokens: 0
+      }));
+    }
+    const line0 = JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T08:00:00Z',
+      step_index: 10,
+      model: 'gemini-3.8-flash',
+      input_tokens: 1000,
+      output_tokens: 200,
+      cache_read_tokens: 4000
+    });
+    const line1Complete = JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T08:01:00Z',
+      step_index: 11,
+      model: 'gemini-3.8-flash',
+      input_tokens: 1200,
+      output_tokens: 150,
+      cache_read_tokens: 4800,
+      note: '跨字节UTF8汉字测试🔥'
+    });
+
+    // 1) UTF-8 多字节字符被劈在文件末尾（“汉”的前 2 个字节）且无结束换行：不得推进 parsedOffset，也不得破坏后续续读
+    const splitTargetBuf = Buffer.from(line1Complete, 'utf8');
+    const hanPos = splitTargetBuf.indexOf(Buffer.from('汉', 'utf8'));
+    assert.ok(hanPos > 0);
+    const committedPrefix = `${line0}\n${prefixLines.join('\n')}\n`;
+    const prefixAndHalfUtf8 = Buffer.concat([Buffer.from(committedPrefix, 'utf8'), splitTargetBuf.subarray(0, hanPos + 2)]);
+    fs.writeFileSync(filePath, prefixAndHalfUtf8);
+
+    const r1 = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(r1.mode, 'full');
+    assert.equal(r1.records.length, 7);
+    assert.equal(r1.records[0].stepIndex, 10);
+
+    // mtime/size 未变 -> cache-hit 且 bytesRead === 0
+    const rHit = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(rHit.mode, 'cache-hit');
+    assert.equal(rHit.bytesRead, 0);
+
+    // 2) 补全后半个 UTF-8 字符及尾行（故意不带结尾 \n）-> 增量解析恢复完整汉字，但 tail 不提前提交 parsedOffset
+    fs.writeFileSync(filePath, Buffer.concat([Buffer.from(committedPrefix, 'utf8'), splitTargetBuf]));
+    const r2 = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(r2.mode, 'incremental');
+    assert.equal(r2.records.length, 8);
+    assert.equal(r2.records[7].stepIndex, 11);
+    assert.equal(r2.records[7].tot, 6150);
+
+    // 3) 追加第三行含 \n，并对比全新全量读取
+    const line2 = JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T08:02:00Z',
+      step_index: 12,
+      model: 'gemini-3.8-flash',
+      input_tokens: 300,
+      output_tokens: 50,
+      cache_read_tokens: 0
+    });
+    fs.writeFileSync(filePath, Buffer.from(`${committedPrefix}${line1Complete}\n${line2}\n`, 'utf8'));
+    const r3 = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(r3.mode, 'incremental');
+    assert.equal(r3.records.length, 9);
+    assert.ok(r3.bytesRead < fs.statSync(filePath).size, '增量读取字节数应显著小于全文件大小');
+
+    const freshMap = new Map();
+    const rFullRef = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), freshMap);
+    assert.deepEqual(
+      r3.records.map(x => ({ eventId: x.eventId, tot: x.tot, inp: x.inp, outp: x.outp, cap: x.cap })),
+      rFullRef.records.map(x => ({ eventId: x.eventId, tot: x.tot, inp: x.inp, outp: x.outp, cap: x.cap }))
+    );
+
+    // 4) 同大小覆写（文件字节长度完全一致，mtimeMs +1s 更新且首行头部发生变更）-> headBuf 失配，必须触发 full 全量重读！
+    const prevSt = fs.statSync(filePath);
+    const sameSizeLine0 = line0.replace('"input_tokens":1000', '"input_tokens":7777');
+    const sameSizeBuf = Buffer.from(`${sameSizeLine0}\n${prefixLines.join('\n')}\n${line1Complete}\n${line2}\n`, 'utf8');
+    assert.equal(sameSizeBuf.length, prevSt.size);
+    fs.writeFileSync(filePath, sameSizeBuf);
+    const futureSec = (prevSt.mtimeMs + 2000) / 1000;
+    fs.utimesSync(filePath, futureSec, futureSec);
+    const rSameSize = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(rSameSize.mode, 'full');
+    assert.equal(rSameSize.records[0].inp, 7777);
+
+    // 5) 截断回退（体积变小）-> 自动 full 重读
+    fs.writeFileSync(filePath, Buffer.from(`${line0}\n`, 'utf8'));
+    const rTrunc = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(rTrunc.mode, 'full');
+    assert.equal(rTrunc.records.length, 1);
+
+    // 6) 日志轮换（删除后重建新 inode）-> 自动识别轮换并全量读取
+    const rotLine = JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T09:00:00Z',
+      step_index: 5,
+      model: 'gemini-4-neon',
+      input_tokens: 900,
+      output_tokens: 100,
+      cache_read_tokens: 0
+    });
+    fs.unlinkSync(filePath);
+    fs.writeFileSync(filePath, Buffer.from(`${rotLine}\n`, 'utf8'));
+    const rRot = loadIncrementalTranscriptRecords(filePath, fs.statSync(filePath), cacheMap);
+    assert.equal(rRot.mode, 'full');
+    assert.equal(rRot.records[0].stepIndex, 5);
+    assert.equal(rRot.records[0].tot, 1000);
+
+    // 7) 只读模式 + 多账号根目录隔离：不创建账本/归档/备份文件，且 acctA 与 acctB 互不串读
+    const agA = path.join(tmpDir, 'acctA');
+    const agB = path.join(tmpDir, 'acctB');
+    const cliA = path.join(tmpDir, 'cliA');
+    const cliB = path.join(tmpDir, 'cliB');
+    const cidB = '66666666-7777-4888-9999-aaaaaaaaaaaa';
+    fs.mkdirSync(path.join(agB, 'brain', cidB, '.system_generated', 'logs'), { recursive: true });
+    fs.mkdirSync(cliA, { recursive: true });
+    fs.mkdirSync(cliB, { recursive: true });
+    fs.writeFileSync(path.join(agB, 'brain', cidB, '.system_generated', 'logs', 'transcript.jsonl'), JSON.stringify({
+      type: 'PLANNER_RESPONSE',
+      created_at: '2026-11-20T10:00:00Z',
+      step_index: 0,
+      model: 'gemini-3.8-flash',
+      input_tokens: 200,
+      output_tokens: 50,
+      cache_read_tokens: 0
+    }) + '\n');
+
+    const roA = await collectTokenHistoryAsync({ force: true, readOnly: true, agDir: agA, agCliDir: cliA, skipWslDiscovery: true });
+    const roB = await collectTokenHistoryAsync({ force: true, readOnly: true, agDir: agB, agCliDir: cliB, skipWslDiscovery: true });
+    assert.equal(roA.summary.grandTotalTokens, 1000);
+    assert.equal(roB.summary.grandTotalTokens, 250);
+    assert.equal(fs.existsSync(path.join(agA, 'pricing_ledger_v1.json')), false);
+    assert.equal(fs.existsSync(path.join(agA, 'token_usage_archive_v2.json')), false);
+    assert.equal(fs.existsSync(path.join(agB, 'pricing_ledger_v1.json')), false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('PR #74 & PR #27: M537/M667/M668/M669/M681 归池、Neon 官方费率与未定价回退、allowedTiers 跨分隔符兼容与动态池建组', () => {
+  const {
+    normalizeModelId,
+    getModelPoolKey,
+    getSharedQuotaGroupKey,
+    getEffectivePricingRules,
+    setDynamicPricingCatalog,
+    calculateRequestApiCost,
+    summarizeApiCost,
+    classifyModelQuotaAvailability,
+    buildModelQuotaSnapshot
+  } = require('./meter-core');
+
+  // 1. 核心占位 ID / Worker / Orchestrator 映射与归池
+  assert.equal(normalizeModelId('MODEL_PLACEHOLDER_M537'), 'gemini-4-neon');
+  assert.equal(normalizeModelId('placeholder-m667'), 'gemini-4-carbon');
+  assert.equal(normalizeModelId('MODEL_PLACEHOLDER_M668'), 'gemini-4-argon');
+  assert.equal(normalizeModelId('MODEL_PLACEHOLDER_M681'), 'gemini-4-argon');
+  assert.equal(normalizeModelId('MODEL_PLACEHOLDER_M669'), 'gemini-4-hydrogen');
+  assert.equal(normalizeModelId('gemini-flash-worker-agy'), 'gemini-4-hydrogen');
+  assert.equal(normalizeModelId('MODEL_PLACEHOLDER_M18'), null);
+  assert.equal(normalizeModelId('MODEL_PLACEHOLDER_M50'), null);
+  assert.equal(normalizeModelId('xenon-pro'), null);
+
+  assert.equal(getSharedQuotaGroupKey('MODEL_PLACEHOLDER_M537'), 'shared_gemini_main');
+  assert.equal(getSharedQuotaGroupKey('MODEL_PLACEHOLDER_M669'), 'shared_gemini_main');
+  assert.equal(getSharedQuotaGroupKey('gemini-flash-worker-agy'), 'shared_gemini_main');
+  assert.equal(getSharedQuotaGroupKey('MODEL_PLACEHOLDER_M667'), 'shared_gemini_carbon');
+  assert.equal(getSharedQuotaGroupKey('MODEL_PLACEHOLDER_M668'), 'shared_gemini_argon');
+  assert.equal(getSharedQuotaGroupKey('MODEL_PLACEHOLDER_M681'), 'shared_gemini_argon');
+
+  // 2. Neon 费率校验与动态价格优先级（保留内置分段价，不被单点动态价格覆盖）
+  const neonRules = getEffectivePricingRules('gemini-4-neon');
+  assert.ok(Array.isArray(neonRules) && neonRules.length >= 1);
+  assert.equal(neonRules[0].inputPerMillion, 3.0);
+  assert.equal(neonRules[0].outputPerMillion, 15.0);
+  assert.equal(neonRules[0].cacheReadPerMillion, 0.15);
+
+  const prevDyn = require('./meter-core').getDynamicPricingCatalog();
+  try {
+    setDynamicPricingCatalog({
+      'gemini-4-neon': [{ inputPerMillion: 99, outputPerMillion: 99, cacheReadPerMillion: 9 }],
+      'gemini-5-alpha': [{ inputPerMillion: 2.0, outputPerMillion: 8.0, cacheReadPerMillion: 0.2 }]
+    });
+    assert.equal(getEffectivePricingRules('gemini-4-neon')[0].inputPerMillion, 3.0, '内置规则应优先于单点动态价格，保护历史分段定价');
+    assert.equal(getEffectivePricingRules('gemini-5-alpha')[0].inputPerMillion, 2.0, '内置缺省的新模型应允许动态价格生效');
+  } finally {
+    setDynamicPricingCatalog(prevDyn || {});
+  }
+
+  // 3. 缺可靠费率时标记未定价且照常累计 Token；Orchestrator 不同变体名称归一化互不串池
+  assert.notEqual(
+    require('./meter-core').normalizeModelLookupName('Orchestrator (Carbon)'),
+    require('./meter-core').normalizeModelLookupName('Orchestrator (Neon)')
+  );
+  const unpricedCost = calculateRequestApiCost({
+    model: 'brand-new-unpriced-model-x',
+    inputTokens: 12000,
+    outputTokens: 3000,
+    cacheReadTokens: 4000
+  });
+  assert.equal(unpricedCost.isPriced, false);
+  const costSum = summarizeApiCost([
+    { model: 'gemini-4-neon', inputTokens: 1000000, outputTokens: 100000, cacheReadTokens: 0 },
+    { model: 'brand-new-unpriced-model-x', inputTokens: 500000, outputTokens: 50000, cacheReadTokens: 0 }
+  ]);
+  assert.ok(costSum.pricedCostUSD > 0);
+  assert.equal(costSum.unpricedRequestsCount, 1);
+
+  // 4. PR #27 allowedTiers 跨连字符/下划线与大小写变体兼容，且不放宽企业级隔离
+  const proPlan = require('./meter-core').parseUserPlanStatus({
+    userStatus: {
+      userTier: { id: 'g1-pro-tier', name: 'Google AI Pro' },
+      planStatus: { planInfo: { teamsTier: 'TEAMS_TIER_PRO' }, availablePromptCredits: 100 }
+    }
+  });
+  const hyphenCfg = classifyModelQuotaAvailability({
+    modelId: 'gemini-4-neon',
+    label: 'Gemini 4 Neon',
+    allowedTiers: ['G1_PRO_TIER', 'TEAMS-TIER-PRO']
+  }, proPlan);
+  assert.equal(hyphenCfg.noPermission, false);
+  const entOnlyCfg = classifyModelQuotaAvailability({
+    modelId: 'gemini-enterprise-only',
+    label: 'Enterprise Only Model',
+    allowedTiers: ['G1-ENTERPRISE-TIER']
+  }, proPlan);
+  assert.equal(entOnlyCfg.noPermission, true);
+
+  // 5. 动态新增模型与池改名同时生效，且继续严格屏蔽 2.5 与内部占位模型
+  const dynSnap = buildModelQuotaSnapshot({
+    userStatusRes: {
+      userStatus: {
+        userTier: { id: 'g1-pro-tier', name: 'Google AI Pro' },
+        cascadeModelConfigData: {
+          clientModelConfigs: [
+            { label: 'Gemini 4 Neon (High)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M532' }, quotaInfo: { remainingFraction: 0.65 } },
+            { label: 'Gemini 5 Alpha', modelOrAlias: { model: 'gemini-5-alpha' }, quotaInfo: { remainingFraction: 0.88 } },
+            { label: 'Gemini 2.5 Pro', modelId: 'gemini-2.5-pro', quotaInfo: { remainingFraction: 1.0 } },
+            { label: 'chat_23310', modelId: 'chat_23310', quotaInfo: { remainingFraction: 1.0 } }
+          ]
+        }
+      }
+    },
+    quotaSummaryRes: {
+      response: {
+        groups: [
+          {
+            groupId: 'gemini-neon-renamed',
+            displayName: 'Gemini Neon Renamed Pool',
+            modelIds: ['Gemini 4 Neon'],
+            buckets: [{ bucketId: 'b-main', window: '5h', remainingFraction: 0.65 }]
+          }
+        ]
+      }
+    }
+  });
+  const poolKeys = dynSnap.pools.map(p => p.poolKey);
+  assert.ok(poolKeys.includes('shared_gemini_main'));
+  assert.ok(poolKeys.includes('shared_gemini5alpha') || poolKeys.some(k => k.includes('gemini5alpha')));
+  assert.ok(!poolKeys.some(k => k.includes('25') || k.includes('23310')));
+  assert.equal(dynSnap.pools.find(p => p.poolKey === 'shared_gemini_main').title, 'Gemini Neon Renamed Pool');
+  assert.equal(getModelPoolKey('gemini-4-neon'), 'gemini-4-neon');
+});
+
+test('v0.9.0-beta.1: unknown_drop 无证据突降防误判、组成步骤边界/残差/脱敏与耗时并发壁钟计算', () => {
+  const {
+    analyzeSteps,
+    buildSessionCompositionBreakdown,
+    detectContextChangeEvents,
+    groupSessionCallsByTurns,
+    sanitizeCompositionPreview
+  } = require('./meter-core');
+
+  // 1. 脱敏辅助：隐藏用户主目录与密钥/Token
+  const masked = sanitizeCompositionPreview('cmd C:\\Users\\demo\\secret\\run.ps1 --token sk-1234567890abcdef');
+  assert.equal(masked.includes('demo'), false);
+  assert.equal(masked.includes('sk-1234567890abcdef'), false);
+
+  // 2. 无 checkpoint 与 prune 证据时的上下文突降，不得误判为 prune，必须记为 unknown_drop
+  const plainSteps = [
+    { userInput: { userResponse: 'read C:\\Users\\demo\\notes.md and check --api-key=secret_token_999' }, createdAt: '2026-11-23T00:00:00Z' },
+    { plannerResponse: { response: 'step 1 ok', thinking: 'thinking trace' }, createdAt: '2026-11-23T00:00:10Z' },
+    { userInput: { userResponse: 'second question' }, createdAt: '2026-11-23T00:01:00Z' },
+    { plannerResponse: { response: 'step 3 ok' }, createdAt: '2026-11-23T00:01:10Z' }
+  ];
+  const dropCalls = [
+    { callId: 'c1', stepIndex: 1, timestamp: Date.parse('2026-11-23T00:00:10Z'), inputTokens: 42000, totalInputTokens: 42000 },
+    { callId: 'c2', stepIndex: 3, timestamp: Date.parse('2026-11-23T00:01:10Z'), inputTokens: 11000, totalInputTokens: 11000 }
+  ];
+  const events = detectContextChangeEvents(plainSteps, dropCalls);
+  assert.equal(events.some(e => e.type === 'prune'), false, '无压缩/剪枝证据时绝不能误判为 prune');
+  const unknownDrop = events.find(e => e.type === 'unknown_drop');
+  assert.ok(unknownDrop, '单凭占用突降应发出 unknown_drop');
+  assert.equal(unknownDrop.detail, 'context_drop_unknown');
+  assert.equal(unknownDrop.beforeTokens, 42000);
+  assert.equal(unknownDrop.afterTokens, 11000);
+
+  // 3. stepCompositionItems、残差分离与步骤前缀对比
+  const analyzed = analyzeSteps(plainSteps);
+  assert.ok(analyzed.stepCompositionItems.user.length >= 2);
+  assert.equal(analyzed.stepCompositionItems.user[0].preview.includes('secret_token_999'), false);
+  const comp = buildSessionCompositionBreakdown(analyzed, { actual: 18000, budget: 256000 }, { targetStepIndex: 3, compareStepIndex: 1 });
+  assert.equal(comp.stepScope, 'step_bounded');
+  assert.equal(comp.actualTokens, 18000);
+  assert.ok(comp.unaccountedTokens === Math.max(0, 18000 - comp.estimatedTotalMedian));
+  const userCat = comp.items.find(i => i.key === 'user');
+  assert.ok(userCat && userCat.deltaTokens > 0);
+
+  // 4. 并发墙钟 vs 累计任务耗时与子代理模型拆分
+  const tBase = Date.parse('2026-11-23T00:00:00Z');
+  const grouped = groupSessionCallsByTurns(
+    [{ stepIndex: 0, timestamp: tBase, preview: 'concurrent work' }],
+    [
+      { callId: 'main-1', agentRole: 'main', stepIndex: 1, timestamp: tBase + 10000, durationSec: 10, ttftSec: 1, streamingSec: 9, inputTokens: 1000, outputTokens: 200, totalTokens: 1200, modelLabel: 'Gemini 4 Neon' },
+      { callId: 'sub-1', agentRole: 'subagent', cascadeId: 'sub-cid-1', parentStepIndex: 0, subagentType: 'research', stepIndex: 1, timestamp: tBase + 10000, durationSec: 8, ttftSec: 1, streamingSec: 7, inputTokens: 500, outputTokens: 100, totalTokens: 600, modelLabel: 'Gemini 3.8 Flash' }
+    ]
+  );
+  assert.equal(grouped.timingSummary.hasIndependentThinkingTimestamps, false);
+  assert.equal(grouped.timingSummary.hasConcurrentCalls, true);
+  assert.ok(grouped.timingSummary.wallClockActiveSec < grouped.timingSummary.cumulativeTaskSec);
+  assert.ok(grouped.timingSummary.concurrencySavedSec > 0);
+  assert.equal(grouped.agentFleetSummary.subagents[0].modelBreakdown[0].modelLabel, 'Gemini 3.8 Flash');
+});
+
